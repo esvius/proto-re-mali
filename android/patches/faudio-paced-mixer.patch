@@ -1,0 +1,253 @@
+diff --git a/src/FAudio_platform_sdl2.c b/src/FAudio_platform_sdl2.c
+index 39f7480..807ca14 100644
+--- a/src/FAudio_platform_sdl2.c
++++ b/src/FAudio_platform_sdl2.c
+@@ -50,6 +50,180 @@ static void FAudio_INTERNAL_MixCallback(void *userdata, Uint8 *stream, int len)
+ 	}
+ }
+ 
++#ifdef __ANDROID__
++#include <stdio.h>
++#include <sys/resource.h>
++#include <sys/syscall.h>
++#include <unistd.h>
++
++/* Android: the output device takes audio in bursts of several quanta (often
++ * ~64 ms), so mixing inside the device callback runs several engine passes
++ * back to back. Clients that refill their voices from OnBufferEnd on their own
++ * thread (as XAudio2 games do) then starve in every pass after the first. Here
++ * the engine is mixed on its own thread, one pass per quantum period, into a
++ * ring buffer the device callback drains.
++ */
++/* The ring holds up to PACED_RING_QUANTA passes; the mixer aims to keep
++ * PACED_TARGET_QUANTA in it (the device takes ~3 at a time on some phones)
++ * and only runs passes back to back when less than one is left.
++ */
++#define PACED_RING_QUANTA 24
++#define PACED_TARGET_QUANTA 6
++
++typedef struct PacedMixer
++{
++	FAudio *audio;
++	SDL_Thread *thread;
++	SDL_mutex *lock;
++	SDL_cond *cond;
++	float *ring;
++	uint32_t quantumFloats; /* samples * channels */
++	uint32_t capacity; /* floats */
++	uint32_t readPos, fill; /* floats */
++	uint32_t periodMs1000; /* quantum period in microseconds */
++	int running;
++} PacedMixer;
++
++static PacedMixer *pacedMixer = NULL;
++
++/* Device reads that found the ring short (each one is audible as a gap);
++ * the port's audio stats read and reset it.
++ */
++static SDL_atomic_t pacedUnderruns;
++
++__attribute__((visibility("default"))) uint32_t FAudio_PacedTakeUnderruns(void)
++{
++	return (uint32_t) SDL_AtomicSet(&pacedUnderruns, 0);
++}
++
++/* The engine's audio callbacks run on the mixer thread, and they are heavy for
++ * a phone. Keep the thread off the slowest cores (by cpu_capacity, where the
++ * scheduler and power hints like to park it) and at audio priority, so a pass
++ * finishes within its period.
++ */
++static void FAudio_INTERNAL_PacedThreadSetup(void)
++{
++	unsigned long long set = 0; /* the raw syscall: cpu_set_t needs _GNU_SOURCE before the first sched.h */
++	int cpu, count = 0, minCap = -1, caps[64];
++	for (cpu = 0; cpu < 64; cpu += 1)
++	{
++		char path[96];
++		FILE *f;
++		caps[cpu] = -1;
++		SDL_snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cpu_capacity", cpu);
++		f = fopen(path, "r");
++		if (f == NULL) continue;
++		if (fscanf(f, "%d", &caps[cpu]) != 1) caps[cpu] = -1;
++		fclose(f);
++		if (caps[cpu] >= 0 && (minCap < 0 || caps[cpu] < minCap)) minCap = caps[cpu];
++	}
++	for (cpu = 0; cpu < 64; cpu += 1)
++	{
++		if (caps[cpu] > minCap)
++		{
++			set |= 1ull << cpu;
++			count += 1;
++		}
++	}
++	if (count > 0) syscall(__NR_sched_setaffinity, 0, sizeof(set), &set);
++	setpriority(PRIO_PROCESS, 0, -16); /* ANDROID_PRIORITY_AUDIO */
++	SDL_Log("FAudio: mixer thread on %d faster cores", count);
++}
++
++static int FAudio_INTERNAL_PacedThread(void *userdata)
++{
++	PacedMixer *m = (PacedMixer*) userdata;
++	float *scratch = (float*) SDL_malloc(m->quantumFloats * sizeof(float));
++	Uint64 freq = SDL_GetPerformanceFrequency();
++	Uint64 period = freq * m->periodMs1000 / 1000000;
++	Uint64 due = SDL_GetPerformanceCounter();
++	Uint64 step = period;
++	uint32_t target = PACED_TARGET_QUANTA * m->quantumFloats;
++	uint32_t i, w;
++
++	SDL_SetThreadPriority(SDL_THREAD_PRIORITY_HIGH);
++	FAudio_INTERNAL_PacedThreadSetup();
++	SDL_LockMutex(m->lock);
++	while (m->running)
++	{
++		Uint64 now = SDL_GetPerformanceCounter();
++		int low = m->fill < m->quantumFloats;
++		int room = m->fill + m->quantumFloats <= m->capacity;
++		if (!room || (!low && now < due))
++		{
++			Uint32 waitMs = 1;
++			if (room && due > now)
++			{
++				waitMs = (Uint32) ((due - now) * 1000 / freq);
++				if (waitMs == 0) waitMs = 1;
++			}
++			SDL_CondWaitTimeout(m->cond, m->lock, waitMs);
++			continue;
++		}
++		/* The next pass comes one period later, stretched or shortened by
++		 * up to a quarter as the ring is above or below its target, so the
++		 * passes stay evenly spaced (the engine refills its voices between
++		 * them) while following the device's clock.
++		 */
++		{
++			int64_t error = ((int64_t) m->fill - (int64_t) target) / (int64_t) m->quantumFloats;
++			int64_t pct = 100 + error * 5;
++			if (pct < 75) pct = 75;
++			if (pct > 125) pct = 125;
++			step = period * (Uint64) pct / 100;
++		}
++		SDL_UnlockMutex(m->lock);
++
++		FAudio_zero(scratch, m->quantumFloats * sizeof(float));
++		if (m->audio->active)
++		{
++			FAudio_INTERNAL_UpdateEngine(m->audio, scratch);
++		}
++		/* Behind schedule (a slow pass) the next one still waits half a
++		 * step rather than running back to back.
++		 */
++		due += step;
++		if (due < now + step / 2) due = now + step / 2;
++
++		SDL_LockMutex(m->lock);
++		w = (m->readPos + m->fill) % m->capacity;
++		for (i = 0; i < m->quantumFloats; i += 1)
++		{
++			m->ring[w] = scratch[i];
++			w = (w + 1 == m->capacity) ? 0 : w + 1;
++		}
++		m->fill += m->quantumFloats;
++	}
++	SDL_UnlockMutex(m->lock);
++	SDL_free(scratch);
++	return 0;
++}
++
++static void FAudio_INTERNAL_PacedCallback(void *userdata, Uint8 *stream, int len)
++{
++	PacedMixer *m = (PacedMixer*) userdata;
++	float *out = (float*) stream;
++	uint32_t want = (uint32_t) len / sizeof(float);
++	uint32_t n, i;
++
++	SDL_LockMutex(m->lock);
++	n = (want < m->fill) ? want : m->fill;
++	for (i = 0; i < n; i += 1)
++	{
++		out[i] = m->ring[m->readPos];
++		m->readPos = (m->readPos + 1 == m->capacity) ? 0 : m->readPos + 1;
++	}
++	m->fill -= n;
++	SDL_CondSignal(m->cond);
++	SDL_UnlockMutex(m->lock);
++	if (n < want)
++	{
++		FAudio_zero(out + n, (want - n) * sizeof(float));
++		SDL_AtomicAdd(&pacedUnderruns, 1);
++	}
++}
++#endif /* __ANDROID__ */
++
+ /* Platform Functions */
+ 
+ static void FAudio_INTERNAL_PrioritizeDirectSound()
+@@ -155,6 +329,15 @@ void FAudio_PlatformInit(
+ 	want.silence = 0;
+ 	want.callback = FAudio_INTERNAL_MixCallback;
+ 	want.userdata = audio;
++#ifdef __ANDROID__
++	if (pacedMixer == NULL)
++	{
++		pacedMixer = (PacedMixer*) SDL_calloc(1, sizeof(PacedMixer));
++		pacedMixer->audio = audio;
++		want.callback = FAudio_INTERNAL_PacedCallback;
++		want.userdata = pacedMixer;
++	}
++#endif
+ 	if (flags & FAUDIO_1024_QUANTUM)
+ 	{
+ 		/* Get the sample count for a 21.33ms frame.
+@@ -215,13 +398,51 @@ iosretry:
+ 	/* SDL_AudioDeviceID is a Uint32, anybody using a 16-bit PC still? */
+ 	*platformDevice = (void*) ((size_t) device);
+ 
++#ifdef __ANDROID__
++	if (pacedMixer != NULL && pacedMixer->audio == audio && pacedMixer->thread == NULL)
++	{
++		PacedMixer *m = pacedMixer;
++		m->quantumFloats = (uint32_t) have.samples * have.channels;
++		m->capacity = m->quantumFloats * PACED_RING_QUANTA;
++		m->ring = (float*) SDL_calloc(m->capacity, sizeof(float));
++		m->periodMs1000 = (uint32_t) ((uint64_t) have.samples * 1000000 / have.freq);
++		m->lock = SDL_CreateMutex();
++		m->cond = SDL_CreateCond();
++		m->running = 1;
++		m->thread = SDL_CreateThread(FAudio_INTERNAL_PacedThread, "FAudioMix", m);
++		SDL_Log("FAudio: paced mixer, %d frames per pass", have.samples);
++	}
++#endif
++
+ 	/* Start the thread! */
+ 	SDL_PauseAudioDevice(device, 0);
+ }
+ 
+ void FAudio_PlatformQuit(void* platformDevice)
+ {
++#ifdef __ANDROID__
++	/* Stop mixing before the device (and FAudio) go away */
++	if (pacedMixer != NULL)
++	{
++		PacedMixer *m = pacedMixer;
++		SDL_LockMutex(m->lock);
++		m->running = 0;
++		SDL_CondSignal(m->cond);
++		SDL_UnlockMutex(m->lock);
++		SDL_WaitThread(m->thread, NULL);
++	}
++#endif
+ 	SDL_CloseAudioDevice((SDL_AudioDeviceID) ((size_t) platformDevice));
++#ifdef __ANDROID__
++	if (pacedMixer != NULL)
++	{
++		SDL_DestroyCond(pacedMixer->cond);
++		SDL_DestroyMutex(pacedMixer->lock);
++		SDL_free(pacedMixer->ring);
++		SDL_free(pacedMixer);
++		pacedMixer = NULL;
++	}
++#endif
+ }
+ 
+ uint32_t FAudio_PlatformGetDeviceCount()

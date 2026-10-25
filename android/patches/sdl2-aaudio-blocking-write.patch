@@ -1,0 +1,14 @@
+diff --git a/src/audio/aaudio/SDL_aaudio.c b/src/audio/aaudio/SDL_aaudio.c
+index 38d9616..efcdffb 100644
+--- a/src/audio/aaudio/SDL_aaudio.c
++++ b/src/audio/aaudio/SDL_aaudio.c
+@@ -300,7 +300,8 @@ static void aaudio_PlayDevice(_THIS)
+ {
+     struct SDL_PrivateAudioData *private = this->hidden;
+     aaudio_result_t res;
+-    int64_t timeoutNanoseconds = 1 * 1000 * 1000; /* 8 ms */
++    /* Block until the whole buffer is queued: a short timeout drops the rest of a partial write. */
++    int64_t timeoutNanoseconds = 200 * 1000 * 1000;
+     res = ctx.AAudioStream_write(private->stream, private->mixbuf, private->mixlen / private->frame_size, timeoutNanoseconds);
+     if (res < 0) {
+         LOGI("%s : %s", __func__, ctx.AAudio_convertResultToText(res));

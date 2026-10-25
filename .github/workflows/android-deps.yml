@@ -1,0 +1,100 @@
+# Third-party native libraries of the Android port (SDL2, FAudio, DXVK d3d9; Turnip and libadrenotools for
+# Adreno), built on GitHub's runners.
+# Nothing here touches game files or code generated from them: the recompiled engine is built locally only.
+name: android-deps
+
+on:
+  push:
+    paths: [android/build-deps.sh, android/build-turnip.sh, android/patches/**, .github/workflows/android-deps.yml]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    strategy:
+      matrix:
+        abi: [arm64-v8a, x86_64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: out/${{ matrix.abi }}
+          key: android-deps-${{ matrix.abi }}-${{ hashFiles('android/build-deps.sh', 'android/patches/**') }}
+
+      - name: Tools
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build glslang-tools pkg-config python3-pip
+          pip3 install --user --break-system-packages meson==1.5.2
+
+      - name: Build
+        if: steps.cache.outputs.cache-hit != 'true'
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
+        run: |
+          export PATH=$HOME/.local/bin:$PATH
+          echo "NDK: $ANDROID_NDK_HOME"
+          android/build-deps.sh ${{ matrix.abi }} src out/${{ matrix.abi }}
+
+      - name: Publish stripped arm64 d3d9 lib to branch build-output
+        if: matrix.abi == 'arm64-v8a'
+        run: |
+          STRIP=$(ls "$ANDROID_NDK_LATEST_HOME"/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip)
+          mkdir -p /tmp/pub
+          cp out/arm64-v8a/lib/libdxvk_d3d9.so /tmp/pub/
+          "$STRIP" --strip-unneeded /tmp/pub/libdxvk_d3d9.so
+          cd /tmp/pub
+          git init -q
+          git checkout -q -b build-output
+          git add libdxvk_d3d9.so
+          git -c user.name=ci -c user.email=ci@users.noreply.github.com commit -qm "libdxvk_d3d9.so from ${{ github.sha }}"
+          git push -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}" build-output
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-deps-${{ matrix.abi }}
+          path: |
+            out/${{ matrix.abi }}/lib/*.so
+            out/${{ matrix.abi }}/include
+          retention-days: 30
+
+  turnip:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: out/turnip
+          key: android-turnip-${{ hashFiles('android/build-turnip.sh') }}
+
+      - name: Tools
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build glslang-tools bison flex python3-pip
+          pip3 install --user --break-system-packages meson==1.5.2 mako pyyaml packaging
+
+      - name: Build
+        if: steps.cache.outputs.cache-hit != 'true'
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
+        run: |
+          export PATH=$HOME/.local/bin:$PATH
+          android/build-turnip.sh src out/turnip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-turnip-arm64-v8a
+          path: |
+            out/turnip/lib
+            out/turnip/include
+          retention-days: 30

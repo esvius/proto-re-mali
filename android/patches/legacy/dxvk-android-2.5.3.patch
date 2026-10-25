@@ -1,0 +1,1191 @@
+diff --git a/src/d3d9/d3d9_device.cpp b/src/d3d9/d3d9_device.cpp
+index 5679c1a..b208612 100644
+--- a/src/d3d9/d3d9_device.cpp
++++ b/src/d3d9/d3d9_device.cpp
+@@ -33,6 +33,8 @@
+ 
+ namespace dxvk {
+ 
++  extern bool g_dxsoNoClipDistance;  // dxso_compiler.cpp
++
+   D3D9DeviceEx::D3D9DeviceEx(
+           D3D9InterfaceEx*       pParent,
+           D3D9Adapter*           pAdapter,
+@@ -70,6 +72,8 @@ namespace dxvk {
+     if (canSWVP)
+       Logger::info("D3D9DeviceEx: Using extended constant set for software vertex processing.");
+ 
++    g_dxsoNoClipDistance = !m_dxvkDevice->features().core.features.shaderClipDistance;
++
+     if (m_dxvkDevice->isDebugEnabled())
+       m_annotation = new D3D9UserDefinedAnnotation(this);
+ 
+@@ -4511,7 +4515,8 @@ namespace dxvk {
+     enabled.core.features.shaderCullDistance = VK_TRUE;
+ 
+     // Ensure we support real BC formats and unofficial vendor ones.
+-    enabled.core.features.textureCompressionBC = VK_TRUE;
++    // Android port: optional, GPUs without BC (Mali) get DXT decoded by the application.
++    enabled.core.features.textureCompressionBC = supported.core.features.textureCompressionBC;
+ 
+     // SM2 level hardware
+     enabled.core.features.occlusionQueryPrecise = VK_TRUE;
+@@ -6327,6 +6332,14 @@ namespace dxvk {
+ 
+     pResource->ClearDirtyBoxes();
+     pResource->ClearNeedsUpload();
++
++    // Same conditions as tossing the staging buffer of a default pool texture on unlock.
++    if (m_d3d9Options.freeManagedCopies
++     && pResource->GetMapMode() == D3D9_COMMON_TEXTURE_MAP_MODE_BACKED
++     && !pResource->IsDynamic()
++     && !pResource->IsAnySubresourceLocked()
++     && pResource->GetFormatMapping().ConversionFormatInfo.FormatType == D3D9ConversionFormat_None)
++      pResource->DestroyBuffer();
+   }
+ 
+ 
+diff --git a/src/d3d9/d3d9_device.h b/src/d3d9/d3d9_device.h
+index c307036..3fbfe44 100644
+--- a/src/d3d9/d3d9_device.h
++++ b/src/d3d9/d3d9_device.h
+@@ -957,6 +957,10 @@ namespace dxvk {
+       return m_multithread.AcquireLock();
+     }
+ 
++    D3D9DeviceMutex* DeviceMutex() {
++      return m_multithread.Mutex();
++    }
++
+     const D3D9Options* GetOptions() const {
+       return &m_d3d9Options;
+     }
+diff --git a/src/d3d9/d3d9_fixed_function.cpp b/src/d3d9/d3d9_fixed_function.cpp
+index a47f89c..2d2f927 100644
+--- a/src/d3d9/d3d9_fixed_function.cpp
++++ b/src/d3d9/d3d9_fixed_function.cpp
+@@ -12,6 +12,8 @@
+ 
+ namespace dxvk {
+ 
++  extern bool g_dxsoNoClipDistance;  // dxso_compiler.cpp
++
+   D3D9FixedFunctionOptions::D3D9FixedFunctionOptions(const D3D9Options* options) {
+     invariantPosition = options->invariantPosition;
+     forceSampleRateShading = options->forceSampleRateShading;
+@@ -1403,7 +1405,7 @@ namespace dxvk {
+     uint32_t pointSize = m_module.opFClamp(m_floatType, pointInfo.defaultValue, pointInfo.min, pointInfo.max);
+     m_module.opStore(m_vs.out.POINTSIZE, pointSize);
+ 
+-    if (m_vsKey.Data.Contents.VertexClipping)
++    if (m_vsKey.Data.Contents.VertexClipping && !g_dxsoNoClipDistance)
+       emitVsClipping(vtx);
+   }
+ 
+@@ -1651,7 +1653,8 @@ namespace dxvk {
+     m_specUbo = SetupSpecUBO(m_module, m_bindings);
+ 
+     // VS Caps
+-    m_module.enableCapability(spv::CapabilityClipDistance);
++    if (!g_dxsoNoClipDistance)
++      m_module.enableCapability(spv::CapabilityClipDistance);
+ 
+     emitLightTypeDecl();
+     emitBaseBufferDecl();
+diff --git a/src/d3d9/d3d9_multithread.h b/src/d3d9/d3d9_multithread.h
+index f91857b..64c0316 100644
+--- a/src/d3d9/d3d9_multithread.h
++++ b/src/d3d9/d3d9_multithread.h
+@@ -1,9 +1,19 @@
+ #pragma once
+ 
++#include "../util/thread.h"
++
+ #include "d3d9_include.h"
+ 
+ namespace dxvk {
+ 
++  // Android port: the engine drives the device from several threads; on big.LITTLE phones the spinning waiters
++  // burn whole cores the main thread and the audio mixer need. A sleeping recursive mutex instead.
++#ifdef __ANDROID__
++  using D3D9DeviceMutex = dxvk::recursive_mutex;
++#else
++  using D3D9DeviceMutex = sync::RecursiveSpinlock;
++#endif
++
+   /**
+    * \brief Device lock
+    *
+@@ -19,7 +29,7 @@ namespace dxvk {
+     D3D9DeviceLock()
+       : m_mutex(nullptr) { }
+ 
+-    D3D9DeviceLock(sync::RecursiveSpinlock& mutex)
++    D3D9DeviceLock(D3D9DeviceMutex& mutex)
+       : m_mutex(&mutex) {
+       mutex.lock();
+     }
+@@ -45,7 +55,7 @@ namespace dxvk {
+ 
+   private:
+ 
+-    sync::RecursiveSpinlock* m_mutex;
++    D3D9DeviceMutex* m_mutex;
+ 
+   };
+ 
+@@ -66,11 +76,16 @@ namespace dxvk {
+         : D3D9DeviceLock();
+     }
+ 
++    // Android port: the device mutex if the device is multithreaded, for Present to drop it while it waits.
++    D3D9DeviceMutex* Mutex() {
++      return m_protected ? &m_mutex : nullptr;
++    }
++
+   private:
+ 
+     BOOL            m_protected;
+ 
+-    sync::RecursiveSpinlock m_mutex;
++    D3D9DeviceMutex m_mutex;
+ 
+   };
+ 
+diff --git a/src/d3d9/d3d9_options.cpp b/src/d3d9/d3d9_options.cpp
+index e535d61..4c2d31e 100644
+--- a/src/d3d9/d3d9_options.cpp
++++ b/src/d3d9/d3d9_options.cpp
+@@ -71,6 +71,11 @@ namespace dxvk {
+     this->allowDirectBufferMapping      = config.getOption<bool>        ("d3d9.allowDirectBufferMapping",      true);
+     this->seamlessCubes                 = config.getOption<bool>        ("d3d9.seamlessCubes",                 false);
+     this->textureMemory                 = config.getOption<int32_t>     ("d3d9.textureMemory",                 100) << 20;
++#ifdef __ANDROID__
++    this->freeManagedCopies             = config.getOption<bool>        ("d3d9.freeManagedCopies",             true);
++#else
++    this->freeManagedCopies             = config.getOption<bool>        ("d3d9.freeManagedCopies",             false);
++#endif
+     this->deviceLossOnFocusLoss         = config.getOption<bool>        ("d3d9.deviceLossOnFocusLoss",         false);
+     this->samplerLodBias                = config.getOption<float>       ("d3d9.samplerLodBias",                0.0f);
+     this->clampNegativeLodBias          = config.getOption<bool>        ("d3d9.clampNegativeLodBias",          false);
+diff --git a/src/d3d9/d3d9_options.h b/src/d3d9/d3d9_options.h
+index 7339f8c..a04b3f3 100644
+--- a/src/d3d9/d3d9_options.h
++++ b/src/d3d9/d3d9_options.h
+@@ -139,6 +139,10 @@ namespace dxvk {
+     /// How much virtual memory will be used for textures (in MB).
+     int32_t textureMemory;
+ 
++    /// Drop the system memory copy of a managed texture once it is on the GPU (a later lock reads it back).
++    /// On phones GPU memory is system memory, so the copy doubles the RAM every managed texture takes.
++    bool freeManagedCopies;
++
+     /// Shader dump path
+     std::string shaderDumpPath;
+ 
+diff --git a/src/d3d9/d3d9_swapchain.cpp b/src/d3d9/d3d9_swapchain.cpp
+index 391cec8..7101c4b 100644
+--- a/src/d3d9/d3d9_swapchain.cpp
++++ b/src/d3d9/d3d9_swapchain.cpp
+@@ -5,6 +5,8 @@
+ #include "d3d9_hud.h"
+ #include "d3d9_window.h"
+ 
++#include <chrono>
++
+ namespace dxvk {
+ 
+   static uint16_t MapGammaControlPoint(float x) {
+@@ -818,7 +820,37 @@ namespace dxvk {
+   }
+ 
+ 
++#ifdef __ANDROID__
++  // Android port: Present waits for the previous present's submission, a free swap chain image and the frame
++  // latency limit. Holding the device lock meanwhile stalls every other thread's buffer locks behind the GPU (the
++  // engine fills vertex buffers from its worker threads), so these waits run unlocked; Present is the only user of
++  // the swap chain state they touch. Present is entered with the lock taken exactly once (D3D9SwapChainEx::Present).
++  struct D3D9PresentUnlocked {
++    D3D9DeviceMutex* m;
++    explicit D3D9PresentUnlocked(D3D9DeviceEx* device) : m(device->DeviceMutex()) { if (m) m->unlock(); }
++    ~D3D9PresentUnlocked() { if (m) m->lock(); }
++  };
++
++  // DXVK_PRESENT_STATS=1: where Present's time goes, logged every 300 frames.
++  struct D3D9PresentStats {
++    bool on = false;
++    uint64_t frames = 0;
++    double submit = 0, acquire = 0, relock = 0, preAcq = 0, acqOnly = 0, latency = 0, total = 0, wallStart = 0;
++    DxvkStatCounters counters;
++    static double now() {
++      return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
++    }
++  };
++  static D3D9PresentStats g_presentStats;
++  extern std::atomic<uint64_t> g_acqFenceUs, g_acqCallUs, g_acqSlow, g_preAcqUs, g_preFenceUs;  // dxvk_presenter.cpp
++#endif
++
+   void D3D9SwapChainEx::PresentImage(UINT SyncInterval) {
++#ifdef __ANDROID__
++    static const bool statsOn = env::getEnvVar("DXVK_PRESENT_STATS") == "1";  // read after the host set it
++    g_presentStats.on = statsOn;
++    const double tStart = g_presentStats.on ? D3D9PresentStats::now() : 0;
++#endif
+     m_parent->EndFrame();
+     m_parent->Flush();
+ 
+@@ -827,7 +859,24 @@ namespace dxvk {
+     Rc<DxvkImageView> swapImageView = m_backBuffers[0]->GetImageView(false);
+ 
+     for (uint32_t i = 0; i < SyncInterval || i < 1; i++) {
++#ifdef __ANDROID__
++      VkResult submitStatus;
++      double t0 = g_presentStats.on ? D3D9PresentStats::now() : 0;
++      {
++        D3D9PresentUnlocked unlocked(m_parent);
++        submitStatus = m_device->waitForSubmission(&m_presentStatus);
++      }
++      double t1 = g_presentStats.on ? D3D9PresentStats::now() : 0;
++      // VK_SUBOPTIMAL_KHR: Android reports it every frame while the display is rotated against the swap chain's
++      // transform (landscape); the compositor rotates, so present as is instead of recreating the swap chain -
++      // with a GPU idle wait - every frame. Unless the window itself changed size (it starts out portrait for a
++      // moment, or the device was rotated): then the swap chain is recreated, or the picture stays wrong.
++      if ((submitStatus != VK_SUCCESS && submitStatus != VK_SUBOPTIMAL_KHR)
++       || (submitStatus == VK_SUBOPTIMAL_KHR && AndroidWindowResized()))
++        RecreateSwapChain();
++#else
+       SynchronizePresent();
++#endif
+ 
+       // Presentation semaphores and WSI swap chain image
+       PresenterInfo info = m_wctx->presenter->info();
+@@ -835,9 +884,35 @@ namespace dxvk {
+ 
+       uint32_t imageIndex = 0;
+ 
++#ifdef __ANDROID__
++      VkResult status;
++      double t2;
++      double tu, ta;
++      {
++        D3D9PresentUnlocked unlocked(m_parent);
++        tu = g_presentStats.on ? D3D9PresentStats::now() : 0;
++        status = m_wctx->presenter->acquireNextImage(sync, imageIndex);
++        t2 = g_presentStats.on ? D3D9PresentStats::now() : 0;
++      }
++      ta = tu;
++      if (g_presentStats.on) {
++        g_presentStats.preAcq += tu - t1;
++        g_presentStats.acqOnly += t2 - ta;
++      }
++      if (g_presentStats.on) {
++        g_presentStats.submit += t1 - t0;
++        g_presentStats.acquire += t2 - t1;
++        g_presentStats.relock += D3D9PresentStats::now() - t2;
++      }
++#else
+       VkResult status = m_wctx->presenter->acquireNextImage(sync, imageIndex);
++#endif
+ 
++#ifdef __ANDROID__
++      while (status != VK_SUCCESS && (status != VK_SUBOPTIMAL_KHR || AndroidWindowResized())) {  // see above
++#else
+       while (status != VK_SUCCESS) {
++#endif
+         RecreateSwapChain();
+         
+         info = m_wctx->presenter->info();
+@@ -913,7 +988,42 @@ namespace dxvk {
+       m_parent->FlushCsChunk();
+     }
+ 
++#ifdef __ANDROID__
++    {
++      double t0 = g_presentStats.on ? D3D9PresentStats::now() : 0;
++      {
++        D3D9PresentUnlocked unlocked(m_parent);
++        SyncFrameLatency();
++      }
++      if (g_presentStats.on) {
++        double t1 = D3D9PresentStats::now();
++        g_presentStats.latency += t1 - t0;
++        g_presentStats.total += t1 - tStart;
++        if (g_presentStats.frames == 0) {
++          g_presentStats.wallStart = t1;
++          g_presentStats.counters = m_device->getStatCounters();
++        }
++        if (++g_presentStats.frames == 301) {
++          const double n = 300;
++          DxvkStatCounters now = m_device->getStatCounters();
++          DxvkStatCounters d = now.diff(g_presentStats.counters);
++          double wall = t1 - g_presentStats.wallStart;
++          Logger::info(str::format("present: ", n * 1000.0 / wall, " fps, per frame ", g_presentStats.total / n,
++            " ms: submit wait ", g_presentStats.submit / n, " acquire ", g_presentStats.acquire / n, " relock ", g_presentStats.relock / n, " (before acquire ", g_presentStats.preAcq / n, " acquire call ", g_presentStats.acqOnly / n, ")",
++            " latency wait ", g_presentStats.latency / n, " | gpu idle ", d.getCtr(DxvkStatCounter::GpuIdleTicks) / 1000.0 / n,
++            " ms, gpu syncs ", d.getCtr(DxvkStatCounter::GpuSyncCount) / n, " (", d.getCtr(DxvkStatCounter::GpuSyncTicks) / 1000.0 / n,
++            " ms), cs syncs ", d.getCtr(DxvkStatCounter::CsSyncCount) / n, " (", d.getCtr(DxvkStatCounter::CsSyncTicks) / 1000.0 / n,
++            " ms), draws ", d.getCtr(DxvkStatCounter::CmdDrawCalls) / n, ", passes ", d.getCtr(DxvkStatCounter::CmdRenderPassCount) / n,
++            ", barriers ", d.getCtr(DxvkStatCounter::CmdBarrierCount) / n, ", submits ", d.getCtr(DxvkStatCounter::QueueSubmitCount) / n,
++            " | app acquires ", g_acqSlow.exchange(0), " fence ", g_acqFenceUs.exchange(0) / 1000.0 / n, " call ", g_acqCallUs.exchange(0) / 1000.0 / n,
++            " ms; queue pre-acquire fence ", g_preFenceUs.exchange(0) / 1000.0 / n, " call ", g_preAcqUs.exchange(0) / 1000.0 / n, " ms"));
++          g_presentStats = D3D9PresentStats();
++        }
++      }
++    }
++#else
+     SyncFrameLatency();
++#endif
+ 
+     // Rotate swap chain buffers so that the back
+     // buffer at index 0 becomes the front buffer.
+@@ -932,6 +1042,16 @@ namespace dxvk {
+       RecreateSwapChain();
+   }
+ 
++#ifdef __ANDROID__
++  bool D3D9SwapChainEx::AndroidWindowResized() {
++    uint32_t width = 0, height = 0;
++    wsi::getWindowSize(m_window, &width, &height);
++    VkExtent2D extent = m_wctx->presenter->info().imageExtent;
++    return width && height && (width != extent.width || height != extent.height);
++  }
++#endif
++
++
+   void D3D9SwapChainEx::RecreateSwapChain() {
+     // Ensure that we can safely destroy the swap chain
+     m_device->waitForSubmission(&m_presentStatus);
+diff --git a/src/d3d9/d3d9_swapchain.h b/src/d3d9/d3d9_swapchain.h
+index 8d80493..863dbad 100644
+--- a/src/d3d9/d3d9_swapchain.h
++++ b/src/d3d9/d3d9_swapchain.h
+@@ -197,6 +197,10 @@ namespace dxvk {
+ 
+     void RecreateSwapChain();
+ 
++#ifdef __ANDROID__
++    bool AndroidWindowResized();
++#endif
++
+     void CreatePresenter();
+ 
+     VkResult CreateSurface(VkSurfaceKHR* pSurface);
+diff --git a/src/dxso/dxso_compiler.cpp b/src/dxso/dxso_compiler.cpp
+index d7cdc67..29299ee 100644
+--- a/src/dxso/dxso_compiler.cpp
++++ b/src/dxso/dxso_compiler.cpp
+@@ -450,8 +450,13 @@ namespace dxvk {
+   }
+ 
+ 
++  // Android port: GPUs without shaderClipDistance (Mali) crash compiling ClipDistance outputs; user clip planes are
++  // then ignored. Set by D3D9DeviceEx from the device features.
++  bool g_dxsoNoClipDistance = false;
++
+   void DxsoCompiler::emitVsInit() {
+-    m_module.enableCapability(spv::CapabilityClipDistance);
++    if (!g_dxsoNoClipDistance)
++      m_module.enableCapability(spv::CapabilityClipDistance);
+ 
+     // Only VS needs this, because PS has
+     // non-indexable specialized output regs
+@@ -3662,7 +3667,8 @@ void DxsoCompiler::emitControlFlowGenericLoop(
+       m_vs.functionId, 0, nullptr);
+     this->emitLinkerOutputSetup();
+ 
+-    this->emitVsClipping();
++    if (!g_dxsoNoClipDistance)
++      this->emitVsClipping();
+ 
+     this->emitFunctionEnd();
+   }
+diff --git a/src/dxvk/dxvk_adapter.cpp b/src/dxvk/dxvk_adapter.cpp
+index 1285c4e..15e8e3a 100644
+--- a/src/dxvk/dxvk_adapter.cpp
++++ b/src/dxvk/dxvk_adapter.cpp
+@@ -165,104 +165,126 @@ namespace dxvk {
+     return queues;
+   }
+ 
++  // Android port: report every missing feature instead of failing silently.
++  static bool checkFeatureNeed(VkBool32 have, VkBool32 need, const char* name) {
++    if (need && !have)
++      Logger::err(str::format("DxvkAdapter: missing required feature ", name));
++    return have || !need;
++  }
++
+ #define CHECK_FEATURE_NEED(feature) \
+-  (m_deviceFeatures.feature         \
+-       || !required.feature)
++  checkFeatureNeed(m_deviceFeatures.feature, required.feature, #feature)
++
++
++  // Android port: drivers (Mali) reject features DXVK enables without checking support; turn each such feature
++  // off and report it instead of failing device creation with VK_ERROR_FEATURE_NOT_PRESENT.
++  template<typename T>
++  static void clampFeatures(T& enabled, const T& supported, const char* name) {
++    constexpr size_t header = 16;  // sType + pNext
++    auto* e = reinterpret_cast<VkBool32*>(reinterpret_cast<char*>(&enabled) + header);
++    auto* s = reinterpret_cast<const VkBool32*>(reinterpret_cast<const char*>(&supported) + header);
++    for (size_t i = 0; i < (sizeof(T) - header) / sizeof(VkBool32); i++) {
++      if (e[i] && !s[i]) {
++        Logger::warn(str::format("DxvkAdapter: ", name, " feature #", i, " not supported, disabled"));
++        e[i] = VK_FALSE;
++      }
++    }
++  }
+ 
+   bool DxvkAdapter::checkFeatureSupport(const DxvkDeviceFeatures& required) const {
+     return CHECK_FEATURE_NEED(core.features.robustBufferAccess)
+-        && CHECK_FEATURE_NEED(core.features.fullDrawIndexUint32)
+-        && CHECK_FEATURE_NEED(core.features.imageCubeArray)
+-        && CHECK_FEATURE_NEED(core.features.independentBlend)
+-        && CHECK_FEATURE_NEED(core.features.geometryShader)
+-        && CHECK_FEATURE_NEED(core.features.tessellationShader)
+-        && CHECK_FEATURE_NEED(core.features.sampleRateShading)
+-        && CHECK_FEATURE_NEED(core.features.dualSrcBlend)
+-        && CHECK_FEATURE_NEED(core.features.logicOp)
+-        && CHECK_FEATURE_NEED(core.features.multiDrawIndirect)
+-        && CHECK_FEATURE_NEED(core.features.drawIndirectFirstInstance)
+-        && CHECK_FEATURE_NEED(core.features.depthClamp)
+-        && CHECK_FEATURE_NEED(core.features.depthBiasClamp)
+-        && CHECK_FEATURE_NEED(core.features.fillModeNonSolid)
+-        && CHECK_FEATURE_NEED(core.features.depthBounds)
+-        && CHECK_FEATURE_NEED(core.features.wideLines)
+-        && CHECK_FEATURE_NEED(core.features.largePoints)
+-        && CHECK_FEATURE_NEED(core.features.alphaToOne)
+-        && CHECK_FEATURE_NEED(core.features.multiViewport)
+-        && CHECK_FEATURE_NEED(core.features.samplerAnisotropy)
+-        && CHECK_FEATURE_NEED(core.features.textureCompressionETC2)
+-        && CHECK_FEATURE_NEED(core.features.textureCompressionASTC_LDR)
+-        && CHECK_FEATURE_NEED(core.features.textureCompressionBC)
+-        && CHECK_FEATURE_NEED(core.features.occlusionQueryPrecise)
+-        && CHECK_FEATURE_NEED(core.features.pipelineStatisticsQuery)
+-        && CHECK_FEATURE_NEED(core.features.vertexPipelineStoresAndAtomics)
+-        && CHECK_FEATURE_NEED(core.features.fragmentStoresAndAtomics)
+-        && CHECK_FEATURE_NEED(core.features.shaderTessellationAndGeometryPointSize)
+-        && CHECK_FEATURE_NEED(core.features.shaderImageGatherExtended)
+-        && CHECK_FEATURE_NEED(core.features.shaderStorageImageExtendedFormats)
+-        && CHECK_FEATURE_NEED(core.features.shaderStorageImageMultisample)
+-        && CHECK_FEATURE_NEED(core.features.shaderStorageImageReadWithoutFormat)
+-        && CHECK_FEATURE_NEED(core.features.shaderStorageImageWriteWithoutFormat)
+-        && CHECK_FEATURE_NEED(core.features.shaderUniformBufferArrayDynamicIndexing)
+-        && CHECK_FEATURE_NEED(core.features.shaderSampledImageArrayDynamicIndexing)
+-        && CHECK_FEATURE_NEED(core.features.shaderStorageBufferArrayDynamicIndexing)
+-        && CHECK_FEATURE_NEED(core.features.shaderStorageImageArrayDynamicIndexing)
+-        && CHECK_FEATURE_NEED(core.features.shaderClipDistance)
+-        && CHECK_FEATURE_NEED(core.features.shaderCullDistance)
+-        && CHECK_FEATURE_NEED(core.features.shaderFloat64)
+-        && CHECK_FEATURE_NEED(core.features.shaderInt64)
+-        && CHECK_FEATURE_NEED(core.features.shaderInt16)
+-        && CHECK_FEATURE_NEED(core.features.shaderResourceResidency)
+-        && CHECK_FEATURE_NEED(core.features.shaderResourceMinLod)
+-        && CHECK_FEATURE_NEED(core.features.sparseBinding)
+-        && CHECK_FEATURE_NEED(core.features.sparseResidencyBuffer)
+-        && CHECK_FEATURE_NEED(core.features.sparseResidencyImage2D)
+-        && CHECK_FEATURE_NEED(core.features.sparseResidencyImage3D)
+-        && CHECK_FEATURE_NEED(core.features.sparseResidency2Samples)
+-        && CHECK_FEATURE_NEED(core.features.sparseResidency4Samples)
+-        && CHECK_FEATURE_NEED(core.features.sparseResidency8Samples)
+-        && CHECK_FEATURE_NEED(core.features.sparseResidency16Samples)
+-        && CHECK_FEATURE_NEED(core.features.sparseResidencyAliased)
+-        && CHECK_FEATURE_NEED(core.features.variableMultisampleRate)
+-        && CHECK_FEATURE_NEED(core.features.inheritedQueries)
+-        && CHECK_FEATURE_NEED(vk11.shaderDrawParameters)
+-        && CHECK_FEATURE_NEED(vk12.samplerMirrorClampToEdge)
+-        && CHECK_FEATURE_NEED(vk12.drawIndirectCount)
+-        && CHECK_FEATURE_NEED(vk12.hostQueryReset)
+-        && CHECK_FEATURE_NEED(vk12.timelineSemaphore)
+-        && CHECK_FEATURE_NEED(vk12.bufferDeviceAddress)
+-        && CHECK_FEATURE_NEED(vk12.shaderOutputViewportIndex)
+-        && CHECK_FEATURE_NEED(vk12.shaderOutputLayer)
+-        && CHECK_FEATURE_NEED(vk13.pipelineCreationCacheControl)
+-        && CHECK_FEATURE_NEED(vk13.shaderDemoteToHelperInvocation)
+-        && CHECK_FEATURE_NEED(vk13.shaderZeroInitializeWorkgroupMemory)
+-        && CHECK_FEATURE_NEED(vk13.synchronization2)
+-        && CHECK_FEATURE_NEED(vk13.dynamicRendering)
+-        && CHECK_FEATURE_NEED(vk13.maintenance4)
+-        && CHECK_FEATURE_NEED(extAttachmentFeedbackLoopLayout.attachmentFeedbackLoopLayout)
+-        && CHECK_FEATURE_NEED(extConservativeRasterization)
+-        && CHECK_FEATURE_NEED(extCustomBorderColor.customBorderColors)
+-        && CHECK_FEATURE_NEED(extCustomBorderColor.customBorderColorWithoutFormat)
+-        && CHECK_FEATURE_NEED(extDepthClipEnable.depthClipEnable)
+-        && CHECK_FEATURE_NEED(extDepthBiasControl.depthBiasControl)
+-        && CHECK_FEATURE_NEED(extDepthBiasControl.leastRepresentableValueForceUnormRepresentation)
+-        && CHECK_FEATURE_NEED(extDepthBiasControl.floatRepresentation)
+-        && CHECK_FEATURE_NEED(extDepthBiasControl.depthBiasExact)
+-        && CHECK_FEATURE_NEED(extGraphicsPipelineLibrary.graphicsPipelineLibrary)
+-        && CHECK_FEATURE_NEED(extMemoryBudget)
+-        && CHECK_FEATURE_NEED(extMemoryPriority.memoryPriority)
+-        && CHECK_FEATURE_NEED(extNonSeamlessCubeMap.nonSeamlessCubeMap)
+-        && CHECK_FEATURE_NEED(extRobustness2.robustBufferAccess2)
+-        && CHECK_FEATURE_NEED(extRobustness2.robustImageAccess2)
+-        && CHECK_FEATURE_NEED(extRobustness2.nullDescriptor)
+-        && CHECK_FEATURE_NEED(extShaderModuleIdentifier.shaderModuleIdentifier)
+-        && CHECK_FEATURE_NEED(extShaderStencilExport)
+-        && CHECK_FEATURE_NEED(extSwapchainColorSpace)
+-        && CHECK_FEATURE_NEED(extSwapchainMaintenance1.swapchainMaintenance1)
+-        && CHECK_FEATURE_NEED(extHdrMetadata)
+-        && CHECK_FEATURE_NEED(extTransformFeedback.transformFeedback)
+-        && CHECK_FEATURE_NEED(extVertexAttributeDivisor.vertexAttributeInstanceRateDivisor)
+-        && CHECK_FEATURE_NEED(extVertexAttributeDivisor.vertexAttributeInstanceRateZeroDivisor);
++        & CHECK_FEATURE_NEED(core.features.fullDrawIndexUint32)
++        & CHECK_FEATURE_NEED(core.features.imageCubeArray)
++        & CHECK_FEATURE_NEED(core.features.independentBlend)
++        & CHECK_FEATURE_NEED(core.features.geometryShader)
++        & CHECK_FEATURE_NEED(core.features.tessellationShader)
++        & CHECK_FEATURE_NEED(core.features.sampleRateShading)
++        & CHECK_FEATURE_NEED(core.features.dualSrcBlend)
++        & CHECK_FEATURE_NEED(core.features.logicOp)
++        & CHECK_FEATURE_NEED(core.features.multiDrawIndirect)
++        & CHECK_FEATURE_NEED(core.features.drawIndirectFirstInstance)
++        & CHECK_FEATURE_NEED(core.features.depthClamp)
++        & CHECK_FEATURE_NEED(core.features.depthBiasClamp)
++        & CHECK_FEATURE_NEED(core.features.fillModeNonSolid)
++        & CHECK_FEATURE_NEED(core.features.depthBounds)
++        & CHECK_FEATURE_NEED(core.features.wideLines)
++        & CHECK_FEATURE_NEED(core.features.largePoints)
++        & CHECK_FEATURE_NEED(core.features.alphaToOne)
++        & CHECK_FEATURE_NEED(core.features.multiViewport)
++        & CHECK_FEATURE_NEED(core.features.samplerAnisotropy)
++        & CHECK_FEATURE_NEED(core.features.textureCompressionETC2)
++        & CHECK_FEATURE_NEED(core.features.textureCompressionASTC_LDR)
++        & CHECK_FEATURE_NEED(core.features.textureCompressionBC)
++        & CHECK_FEATURE_NEED(core.features.occlusionQueryPrecise)
++        & CHECK_FEATURE_NEED(core.features.pipelineStatisticsQuery)
++        & CHECK_FEATURE_NEED(core.features.vertexPipelineStoresAndAtomics)
++        & CHECK_FEATURE_NEED(core.features.fragmentStoresAndAtomics)
++        & CHECK_FEATURE_NEED(core.features.shaderTessellationAndGeometryPointSize)
++        & CHECK_FEATURE_NEED(core.features.shaderImageGatherExtended)
++        & CHECK_FEATURE_NEED(core.features.shaderStorageImageExtendedFormats)
++        & CHECK_FEATURE_NEED(core.features.shaderStorageImageMultisample)
++        & CHECK_FEATURE_NEED(core.features.shaderStorageImageReadWithoutFormat)
++        & CHECK_FEATURE_NEED(core.features.shaderStorageImageWriteWithoutFormat)
++        & CHECK_FEATURE_NEED(core.features.shaderUniformBufferArrayDynamicIndexing)
++        & CHECK_FEATURE_NEED(core.features.shaderSampledImageArrayDynamicIndexing)
++        & CHECK_FEATURE_NEED(core.features.shaderStorageBufferArrayDynamicIndexing)
++        & CHECK_FEATURE_NEED(core.features.shaderStorageImageArrayDynamicIndexing)
++        & CHECK_FEATURE_NEED(core.features.shaderClipDistance)
++        & CHECK_FEATURE_NEED(core.features.shaderCullDistance)
++        & CHECK_FEATURE_NEED(core.features.shaderFloat64)
++        & CHECK_FEATURE_NEED(core.features.shaderInt64)
++        & CHECK_FEATURE_NEED(core.features.shaderInt16)
++        & CHECK_FEATURE_NEED(core.features.shaderResourceResidency)
++        & CHECK_FEATURE_NEED(core.features.shaderResourceMinLod)
++        & CHECK_FEATURE_NEED(core.features.sparseBinding)
++        & CHECK_FEATURE_NEED(core.features.sparseResidencyBuffer)
++        & CHECK_FEATURE_NEED(core.features.sparseResidencyImage2D)
++        & CHECK_FEATURE_NEED(core.features.sparseResidencyImage3D)
++        & CHECK_FEATURE_NEED(core.features.sparseResidency2Samples)
++        & CHECK_FEATURE_NEED(core.features.sparseResidency4Samples)
++        & CHECK_FEATURE_NEED(core.features.sparseResidency8Samples)
++        & CHECK_FEATURE_NEED(core.features.sparseResidency16Samples)
++        & CHECK_FEATURE_NEED(core.features.sparseResidencyAliased)
++        & CHECK_FEATURE_NEED(core.features.variableMultisampleRate)
++        & CHECK_FEATURE_NEED(core.features.inheritedQueries)
++        & CHECK_FEATURE_NEED(vk11.shaderDrawParameters)
++        & CHECK_FEATURE_NEED(vk12.samplerMirrorClampToEdge)
++        & CHECK_FEATURE_NEED(vk12.drawIndirectCount)
++        & CHECK_FEATURE_NEED(vk12.hostQueryReset)
++        & CHECK_FEATURE_NEED(vk12.timelineSemaphore)
++        & CHECK_FEATURE_NEED(vk12.bufferDeviceAddress)
++        & CHECK_FEATURE_NEED(vk12.shaderOutputViewportIndex)
++        & CHECK_FEATURE_NEED(vk12.shaderOutputLayer)
++        & CHECK_FEATURE_NEED(vk13.pipelineCreationCacheControl)
++        & CHECK_FEATURE_NEED(vk13.shaderDemoteToHelperInvocation)
++        & CHECK_FEATURE_NEED(vk13.shaderZeroInitializeWorkgroupMemory)
++        & CHECK_FEATURE_NEED(vk13.synchronization2)
++        & CHECK_FEATURE_NEED(vk13.dynamicRendering)
++        & CHECK_FEATURE_NEED(vk13.maintenance4)
++        & CHECK_FEATURE_NEED(extAttachmentFeedbackLoopLayout.attachmentFeedbackLoopLayout)
++        & CHECK_FEATURE_NEED(extConservativeRasterization)
++        & CHECK_FEATURE_NEED(extCustomBorderColor.customBorderColors)
++        & CHECK_FEATURE_NEED(extCustomBorderColor.customBorderColorWithoutFormat)
++        & CHECK_FEATURE_NEED(extDepthClipEnable.depthClipEnable)
++        & CHECK_FEATURE_NEED(extDepthBiasControl.depthBiasControl)
++        & CHECK_FEATURE_NEED(extDepthBiasControl.leastRepresentableValueForceUnormRepresentation)
++        & CHECK_FEATURE_NEED(extDepthBiasControl.floatRepresentation)
++        & CHECK_FEATURE_NEED(extDepthBiasControl.depthBiasExact)
++        & CHECK_FEATURE_NEED(extGraphicsPipelineLibrary.graphicsPipelineLibrary)
++        & CHECK_FEATURE_NEED(extMemoryBudget)
++        & CHECK_FEATURE_NEED(extMemoryPriority.memoryPriority)
++        & CHECK_FEATURE_NEED(extNonSeamlessCubeMap.nonSeamlessCubeMap)
++        & CHECK_FEATURE_NEED(extRobustness2.robustBufferAccess2)
++        & CHECK_FEATURE_NEED(extRobustness2.robustImageAccess2)
++        & CHECK_FEATURE_NEED(extRobustness2.nullDescriptor)
++        & CHECK_FEATURE_NEED(extShaderModuleIdentifier.shaderModuleIdentifier)
++        & CHECK_FEATURE_NEED(extShaderStencilExport)
++        & CHECK_FEATURE_NEED(extSwapchainColorSpace)
++        & CHECK_FEATURE_NEED(extSwapchainMaintenance1.swapchainMaintenance1)
++        & CHECK_FEATURE_NEED(extHdrMetadata)
++        & CHECK_FEATURE_NEED(extTransformFeedback.transformFeedback)
++        & CHECK_FEATURE_NEED(extVertexAttributeDivisor.vertexAttributeInstanceRateDivisor)
++        & CHECK_FEATURE_NEED(extVertexAttributeDivisor.vertexAttributeInstanceRateZeroDivisor);
+   }
+ 
+ #undef CHECK_FEATURE_NEED
+@@ -489,6 +511,37 @@ namespace dxvk {
+     if (devExtensions.amdMemoryOverallocationBehaviour)
+       overallocInfo.pNext = std::exchange(info.pNext, &overallocInfo);
+     
++#define CLAMP_FEATURES(m) clampFeatures(enabledFeatures.m, m_deviceFeatures.m, #m)
++    CLAMP_FEATURES(core);
++    CLAMP_FEATURES(vk11);
++    CLAMP_FEATURES(vk12);
++    CLAMP_FEATURES(vk13);
++    CLAMP_FEATURES(extAttachmentFeedbackLoopLayout);
++    CLAMP_FEATURES(extCustomBorderColor);
++    CLAMP_FEATURES(extDepthClipEnable);
++    CLAMP_FEATURES(extDepthBiasControl);
++    CLAMP_FEATURES(extExtendedDynamicState3);
++    CLAMP_FEATURES(extFragmentShaderInterlock);
++    CLAMP_FEATURES(extGraphicsPipelineLibrary);
++    CLAMP_FEATURES(extLineRasterization);
++    CLAMP_FEATURES(extMemoryPriority);
++    CLAMP_FEATURES(extNonSeamlessCubeMap);
++    CLAMP_FEATURES(extPageableDeviceLocalMemory);
++    CLAMP_FEATURES(extRobustness2);
++
++    // Android port: DXVK_NO_NULL_DESCRIPTOR=1 runs the dummy-resource path (dxvk_unbound.cpp) on drivers that
++    // have null descriptors, to test what Mali drivers without VK_EXT_robustness2 get.
++    if (env::getEnvVar("DXVK_NO_NULL_DESCRIPTOR") == "1")
++      enabledFeatures.extRobustness2.nullDescriptor = VK_FALSE;
++    CLAMP_FEATURES(extShaderModuleIdentifier);
++    CLAMP_FEATURES(extSwapchainMaintenance1);
++    CLAMP_FEATURES(extTransformFeedback);
++    CLAMP_FEATURES(extVertexAttributeDivisor);
++    CLAMP_FEATURES(khrMaintenance5);
++    CLAMP_FEATURES(khrPresentId);
++    CLAMP_FEATURES(khrPresentWait);
++#undef CLAMP_FEATURES
++
+     VkDevice device = VK_NULL_HANDLE;
+     VkResult vr = m_vki->vkCreateDevice(m_handle, &info, nullptr, &device);
+ 
+@@ -511,7 +564,7 @@ namespace dxvk {
+     }
+ 
+     if (vr != VK_SUCCESS)
+-      throw DxvkError("DxvkAdapter: Failed to create device");
++      throw DxvkError(str::format("DxvkAdapter: Failed to create device: ", vr));
+     
+     Rc<vk::DeviceFn> vkd = new vk::DeviceFn(m_vki, true, device);
+ 
+diff --git a/src/dxvk/dxvk_buffer.cpp b/src/dxvk/dxvk_buffer.cpp
+index 364d7a5..fa9185b 100644
+--- a/src/dxvk/dxvk_buffer.cpp
++++ b/src/dxvk/dxvk_buffer.cpp
+@@ -27,8 +27,17 @@ namespace dxvk {
+       m_info.debugName = nullptr;
+     }
+ 
+-    // Create and assign actual buffer resource
+-    assignStorage(allocateStorage());
++    // Create and assign actual buffer resource. A failed allocation throws (D3D9 turns that into an error code)
++    // instead of dereferencing a null storage; the allocator must not keep a pointer to the half-built buffer.
++    Rc<DxvkResourceAllocation> storage = allocateStorage();
++
++    if (unlikely(!storage)) {
++      m_allocator->unregisterResource(this);
++      throw DxvkError(str::format("DxvkBuffer: Failed to create buffer, size ", createInfo.size,
++        ", usage ", std::hex, createInfo.usage, ", memory flags ", memFlags));
++    }
++
++    assignStorage(std::move(storage));
+   }
+ 
+ 
+diff --git a/src/dxvk/dxvk_context.cpp b/src/dxvk/dxvk_context.cpp
+index c0c3d92..356a792 100644
+--- a/src/dxvk/dxvk_context.cpp
++++ b/src/dxvk/dxvk_context.cpp
+@@ -1014,6 +1014,34 @@ namespace dxvk {
+   }
+ 
+ 
++  // Android port: without VK_EXT_robustness2 null descriptors (Mali), unbound slots get dummy resources.
++  VkImageView DxvkContext::nullImageView(VkImageViewType type) {
++    if (likely(m_device->features().extRobustness2.nullDescriptor))
++      return VK_NULL_HANDLE;
++    return m_common->dummyResources().imageViewHandle(this, type);
++  }
++
++
++  VkImageLayout DxvkContext::nullImageLayout() const {
++    return m_device->features().extRobustness2.nullDescriptor
++      ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_GENERAL;
++  }
++
++
++  VkBufferView DxvkContext::nullBufferView() {
++    if (likely(m_device->features().extRobustness2.nullDescriptor))
++      return VK_NULL_HANDLE;
++    return m_common->dummyResources().bufferViewHandle();
++  }
++
++
++  VkBuffer DxvkContext::nullBuffer() {
++    if (likely(m_device->features().extRobustness2.nullDescriptor))
++      return VK_NULL_HANDLE;
++    return m_common->dummyResources().bufferHandle();
++  }
++
++
+   void DxvkContext::initImage(
+     const Rc<DxvkImage>&            image,
+     const VkImageSubresourceRange&  subresources,
+@@ -5367,8 +5395,8 @@ namespace dxvk {
+               m_cmd->track(res.imageView->image(), DxvkAccess::Read);
+             } else {
+               descriptorInfo.image.sampler = VK_NULL_HANDLE;
+-              descriptorInfo.image.imageView = VK_NULL_HANDLE;
+-              descriptorInfo.image.imageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++              descriptorInfo.image.imageView = nullImageView(binding.viewType);
++              descriptorInfo.image.imageLayout = nullImageLayout();
+             }
+           } break;
+ 
+@@ -5389,8 +5417,8 @@ namespace dxvk {
+                 ? DxvkAccess::Write : DxvkAccess::Read);
+             } else {
+               descriptorInfo.image.sampler = VK_NULL_HANDLE;
+-              descriptorInfo.image.imageView = VK_NULL_HANDLE;
+-              descriptorInfo.image.imageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++              descriptorInfo.image.imageView = nullImageView(binding.viewType);
++              descriptorInfo.image.imageLayout = nullImageLayout();
+             }
+           } break;
+ 
+@@ -5411,8 +5439,8 @@ namespace dxvk {
+               m_cmd->track(res.imageView->image(), DxvkAccess::Read);
+             } else {
+               descriptorInfo.image.sampler = m_common->dummyResources().samplerHandle();
+-              descriptorInfo.image.imageView = VK_NULL_HANDLE;
+-              descriptorInfo.image.imageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++              descriptorInfo.image.imageView = nullImageView(binding.viewType);
++              descriptorInfo.image.imageLayout = nullImageLayout();
+             }
+           } break;
+ 
+@@ -5424,7 +5452,7 @@ namespace dxvk {
+ 
+               m_cmd->track(res.bufferView->buffer(), DxvkAccess::Read);
+             } else {
+-              descriptorInfo.texelBuffer = VK_NULL_HANDLE;
++              descriptorInfo.texelBuffer = nullBufferView();
+             }
+           } break;
+ 
+@@ -5437,7 +5465,7 @@ namespace dxvk {
+               m_cmd->track(res.bufferView->buffer(), (binding.access & vk::AccessWriteMask)
+                 ? DxvkAccess::Write : DxvkAccess::Read);
+             } else {
+-              descriptorInfo.texelBuffer = VK_NULL_HANDLE;
++              descriptorInfo.texelBuffer = nullBufferView();
+             }
+           } break;
+ 
+@@ -5449,7 +5477,7 @@ namespace dxvk {
+ 
+               m_cmd->track(res.bufferSlice.buffer(), DxvkAccess::Read);
+             } else {
+-              descriptorInfo.buffer.buffer = VK_NULL_HANDLE;
++              descriptorInfo.buffer.buffer = nullBuffer();
+               descriptorInfo.buffer.offset = 0;
+               descriptorInfo.buffer.range = VK_WHOLE_SIZE;
+             }
+@@ -5464,7 +5492,7 @@ namespace dxvk {
+               m_cmd->track(res.bufferSlice.buffer(), (binding.access & vk::AccessWriteMask)
+                 ? DxvkAccess::Write : DxvkAccess::Read);
+             } else {
+-              descriptorInfo.buffer.buffer = VK_NULL_HANDLE;
++              descriptorInfo.buffer.buffer = nullBuffer();
+               descriptorInfo.buffer.offset = 0;
+               descriptorInfo.buffer.range = VK_WHOLE_SIZE;
+             }
+@@ -5785,9 +5813,9 @@ namespace dxvk {
+ 
+         m_cmd->track(m_state.vi.vertexBuffers[binding].buffer(), DxvkAccess::Read);
+       } else {
+-        buffers[i] = VK_NULL_HANDLE;
++        buffers[i] = nullBuffer();
+         offsets[i] = 0;
+-        lengths[i] = 0;
++        lengths[i] = buffers[i] ? VK_WHOLE_SIZE : 0;
+         strides[i] = 0;
+       }
+     }
+diff --git a/src/dxvk/dxvk_context.h b/src/dxvk/dxvk_context.h
+index a978af1..b67b11b 100644
+--- a/src/dxvk/dxvk_context.h
++++ b/src/dxvk/dxvk_context.h
+@@ -905,6 +905,12 @@ namespace dxvk {
+       const VkImageSubresourceRange&  subresources,
+             VkImageLayout             initialLayout);
+ 
++    // Android port: dummy resources for unbound slots on drivers without null descriptors.
++    VkImageView nullImageView(VkImageViewType type);
++    VkImageLayout nullImageLayout() const;
++    VkBufferView nullBufferView();
++    VkBuffer nullBuffer();
++
+     /**
+      * \brief Initializes sparse image
+      *
+diff --git a/src/dxvk/dxvk_extensions.h b/src/dxvk/dxvk_extensions.h
+index b8df6d1..5096d44 100644
+--- a/src/dxvk/dxvk_extensions.h
++++ b/src/dxvk/dxvk_extensions.h
+@@ -310,7 +310,7 @@ namespace dxvk {
+     DxvkExt extMemoryPriority                 = { VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME,                    DxvkExtMode::Optional };
+     DxvkExt extNonSeamlessCubeMap             = { VK_EXT_NON_SEAMLESS_CUBE_MAP_EXTENSION_NAME,              DxvkExtMode::Optional };
+     DxvkExt extPageableDeviceLocalMemory      = { VK_EXT_PAGEABLE_DEVICE_LOCAL_MEMORY_EXTENSION_NAME,       DxvkExtMode::Optional };
+-    DxvkExt extRobustness2                    = { VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,                       DxvkExtMode::Required };
++    DxvkExt extRobustness2                    = { VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,                       DxvkExtMode::Optional };  // Android port: Mali lacks it
+     DxvkExt extShaderModuleIdentifier         = { VK_EXT_SHADER_MODULE_IDENTIFIER_EXTENSION_NAME,           DxvkExtMode::Optional };
+     DxvkExt extShaderStencilExport            = { VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME,              DxvkExtMode::Optional };
+     DxvkExt extSwapchainColorSpace            = { VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME,              DxvkExtMode::Optional };
+diff --git a/src/dxvk/dxvk_presenter.cpp b/src/dxvk/dxvk_presenter.cpp
+index 27d6bb1..922f178 100644
+--- a/src/dxvk/dxvk_presenter.cpp
++++ b/src/dxvk/dxvk_presenter.cpp
+@@ -1,3 +1,5 @@
++#include <chrono>
++#include <atomic>
+ #include <algorithm>
+ 
+ #include "dxvk_device.h"
+@@ -54,17 +56,29 @@ namespace dxvk {
+   }
+ 
+ 
++  // Android port diagnostics (DXVK_PRESENT_STATS): where an application-side acquire waits.
++  std::atomic<uint64_t> g_acqFenceUs{0}, g_acqCallUs{0}, g_acqSlow{0}, g_preAcqUs{0}, g_preFenceUs{0};
++  static uint64_t nowUs() {
++    return std::chrono::duration_cast<std::chrono::microseconds>(
++      std::chrono::steady_clock::now().time_since_epoch()).count();
++  }
++
+   VkResult Presenter::acquireNextImage(PresenterSync& sync, uint32_t& index) {
+     PresenterSync& semaphores = m_semaphores.at(m_frameIndex);
+     sync = semaphores;
+ 
+     // Don't acquire more than one image at a time
+     if (m_acquireStatus == VK_NOT_READY) {
++      uint64_t t0 = nowUs();
+       waitForSwapchainFence(semaphores);
++      uint64_t t1 = nowUs();
+ 
+       m_acquireStatus = m_vkd->vkAcquireNextImageKHR(m_vkd->device(),
+         m_swapchain, std::numeric_limits<uint64_t>::max(),
+         sync.acquire, VK_NULL_HANDLE, &m_imageIndex);
++      g_acqFenceUs += t1 - t0;
++      g_acqCallUs += nowUs() - t1;
++      g_acqSlow += 1;
+     }
+ 
+     if (m_acquireStatus != VK_SUCCESS && m_acquireStatus != VK_SUBOPTIMAL_KHR)
+@@ -122,11 +136,15 @@ namespace dxvk {
+     m_frameIndex %= m_semaphores.size();
+ 
+     PresenterSync& nextSync = m_semaphores.at(m_frameIndex);
++    uint64_t t0 = nowUs();
+     waitForSwapchainFence(nextSync);
++    uint64_t t1 = nowUs();
+ 
+     m_acquireStatus = m_vkd->vkAcquireNextImageKHR(m_vkd->device(),
+       m_swapchain, std::numeric_limits<uint64_t>::max(),
+       nextSync.acquire, VK_NULL_HANDLE, &m_imageIndex);
++    g_preFenceUs += t1 - t0;
++    g_preAcqUs += nowUs() - t1;
+ 
+     return status;
+   }
+diff --git a/src/dxvk/dxvk_unbound.cpp b/src/dxvk/dxvk_unbound.cpp
+index 63e3f4d..25e17b8 100644
+--- a/src/dxvk/dxvk_unbound.cpp
++++ b/src/dxvk/dxvk_unbound.cpp
+@@ -1,3 +1,4 @@
++#include "dxvk_context.h"
+ #include "dxvk_device.h"
+ 
+ namespace dxvk {
+@@ -53,6 +54,89 @@ namespace dxvk {
+   }
+ 
+ 
++  VkImageView DxvkUnboundResources::imageViewHandle(DxvkContext* ctx, VkImageViewType type) {
++    VkImageView view = m_viewHandles[type].load();
++
++    if (likely(view != VK_NULL_HANDLE))
++      return view;
++
++    std::lock_guard lock(m_mutex);
++    view = m_viewHandles[type].load();
++
++    if (view)
++      return view;
++
++    uint32_t family = (type == VK_IMAGE_VIEW_TYPE_1D || type == VK_IMAGE_VIEW_TYPE_1D_ARRAY) ? 0u
++                    : (type == VK_IMAGE_VIEW_TYPE_3D) ? 2u : 1u;
++
++    if (m_images[family] == nullptr) {
++      Logger::info(str::format("DxvkUnboundResources: no null descriptors, dummy image for view type ", type));
++
++      DxvkImageCreateInfo info;
++      info.type        = family == 0u ? VK_IMAGE_TYPE_1D : family == 2u ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
++      info.format      = VK_FORMAT_R8G8B8A8_UNORM;
++      info.flags       = family == 1u ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0u;
++      info.sampleCount = VK_SAMPLE_COUNT_1_BIT;
++      info.extent      = { 1u, 1u, 1u };
++      info.numLayers   = family == 1u ? 6u : 1u;
++      info.mipLevels   = 1u;
++      info.usage       = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
++      info.stages      = VK_PIPELINE_STAGE_TRANSFER_BIT | m_device->getShaderPipelineStages();
++      info.access      = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
++      info.layout      = VK_IMAGE_LAYOUT_GENERAL;
++      info.debugName   = "Null image";
++
++      m_images[family] = m_device->createImage(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
++
++      DxvkImageViewKey key;
++      key.viewType   = family == 0u ? VK_IMAGE_VIEW_TYPE_1D_ARRAY
++                     : family == 2u ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D_ARRAY;
++      key.usage      = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
++      key.format     = info.format;
++      key.aspects    = VK_IMAGE_ASPECT_COLOR_BIT;
++      key.mipIndex   = 0u;
++      key.mipCount   = 1u;
++      key.layerIndex = 0u;
++      key.layerCount = uint16_t(info.numLayers);
++      m_imageViews[family] = m_images[family]->createView(key);
++
++      VkImageSubresourceRange range = { VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, info.numLayers };
++      ctx->initImage(m_images[family], range, VK_IMAGE_LAYOUT_UNDEFINED);
++    }
++
++    view = m_imageViews[family]->handle(type);
++    m_viewHandles[type].store(view, std::memory_order_release);
++    return view;
++  }
++
++
++  VkBufferView DxvkUnboundResources::bufferViewHandle() {
++    VkBufferView view = m_bufferViewHandle.load();
++
++    if (likely(view != VK_NULL_HANDLE))
++      return view;
++
++    bufferHandle();  // creates the buffer
++
++    std::lock_guard lock(m_mutex);
++    view = m_bufferViewHandle.load();
++
++    if (view)
++      return view;
++
++    DxvkBufferViewKey key;
++    key.format = VK_FORMAT_R32_UINT;
++    key.usage  = VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT;
++    key.offset = 0u;
++    key.size   = m_buffer->info().size;
++    m_bufferView = m_buffer->createView(key);
++
++    view = m_bufferView->handle();
++    m_bufferViewHandle.store(view, std::memory_order_release);
++    return view;
++  }
++
++
+   Rc<DxvkSampler> DxvkUnboundResources::createSampler() {
+     DxvkSamplerKey info;
+     info.setFilter(VK_FILTER_LINEAR, VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_LINEAR);
+@@ -76,8 +160,11 @@ namespace dxvk {
+                     | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT
+                     | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+                     | VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT
+-                    | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT
+-                    | VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT;
++                    | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT;
++
++    // Android port: not on drivers without transform feedback (Mali), where the usage bit is invalid
++    if (m_device->features().extTransformFeedback.transformFeedback)
++      info.usage |= VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT;
+     info.stages     = VK_PIPELINE_STAGE_TRANSFER_BIT
+                     | m_device->getShaderPipelineStages();
+     info.access     = VK_ACCESS_UNIFORM_READ_BIT
+diff --git a/src/dxvk/dxvk_unbound.h b/src/dxvk/dxvk_unbound.h
+index 9caa9fd..55d0ece 100644
+--- a/src/dxvk/dxvk_unbound.h
++++ b/src/dxvk/dxvk_unbound.h
+@@ -43,7 +43,28 @@ namespace dxvk {
+      * \returns Dummy sampler descriptor
+      */
+     VkSampler samplerHandle();
+-    
++
++    /**
++     * \brief Dummy image view (Android port)
++     *
++     * For drivers without VK_EXT_robustness2 null descriptors (Arm's Mali
++     * drivers): a 1x1 zero image of a compatible type. The first call for
++     * an image type clears it through the given context.
++     * \param [in] ctx Context to initialize the image with
++     * \param [in] type View type the descriptor expects
++     * \returns Dummy image view handle
++     */
++    VkImageView imageViewHandle(DxvkContext* ctx, VkImageViewType type);
++
++    /**
++     * \brief Dummy texel buffer view (Android port)
++     *
++     * R32_UINT view of the dummy buffer, for drivers without null
++     * descriptors.
++     * \returns Dummy buffer view handle
++     */
++    VkBufferView bufferViewHandle();
++
+   private:
+     
+     DxvkDevice*             m_device;
+@@ -54,6 +75,12 @@ namespace dxvk {
+     dxvk::mutex             m_mutex;
+     Rc<DxvkSampler>         m_sampler;
+     Rc<DxvkBuffer>          m_buffer;
++
++    std::atomic<VkImageView> m_viewHandles[VK_IMAGE_VIEW_TYPE_CUBE_ARRAY + 1] = { };
++    Rc<DxvkImage>           m_images[3];  // 1D, 2D (cube compatible, 6 layers), 3D
++    Rc<DxvkImageView>       m_imageViews[3];
++    std::atomic<VkBufferView> m_bufferViewHandle = { VK_NULL_HANDLE };
++    Rc<DxvkBufferView>      m_bufferView;
+     
+     Rc<DxvkSampler> createSampler();
+     
+diff --git a/src/util/log/log.cpp b/src/util/log/log.cpp
+index 2fca3ec..76f7f7f 100644
+--- a/src/util/log/log.cpp
++++ b/src/util/log/log.cpp
+@@ -109,8 +109,13 @@ namespace dxvk {
+ #endif
+         }
+ 
+-        if (m_fileStream)
++        if (m_fileStream) {
+           m_fileStream << adjusted;
++#ifdef __ANDROID__
++          // Android: the process often dies from a crash (or is killed) right after the interesting message.
++          m_fileStream.flush();
++#endif
++        }
+       }
+     }
+   }
+diff --git a/src/vulkan/vulkan_loader.cpp b/src/vulkan/vulkan_loader.cpp
+index 17e9b62..198b7b3 100644
+--- a/src/vulkan/vulkan_loader.cpp
++++ b/src/vulkan/vulkan_loader.cpp
+@@ -1,3 +1,4 @@
++#include <cstdlib>
+ #include <tuple>
+ 
+ #include "vulkan_loader.h"
+@@ -10,6 +11,18 @@
+ namespace dxvk::vk {
+ 
+   static std::pair<HMODULE, PFN_vkGetInstanceProcAddr> loadVulkanLibrary() {
++#ifdef __ANDROID__
++    // Android port: the host may have loaded a bundled driver (Turnip via adrenotools on Adreno) and passes its
++    // vkGetInstanceProcAddr as a hex address.
++    if (const char* gipa = std::getenv("DXVK_VK_GIPA")) {
++      auto proc = reinterpret_cast<PFN_vkGetInstanceProcAddr>(std::strtoull(gipa, nullptr, 16));
++      if (proc) {
++        Logger::info(str::format("Vulkan: using the host's vkGetInstanceProcAddr @ ", gipa));
++        return std::make_pair(HMODULE(nullptr), proc);
++      }
++    }
++#endif
++
+     static const std::array<const char*, 2> dllNames = {{
+ #ifdef _WIN32
+       "winevulkan.dll",
+diff --git a/src/wsi/sdl2/wsi_platform_sdl2.cpp b/src/wsi/sdl2/wsi_platform_sdl2.cpp
+index 203cb6d..d8c0255 100644
+--- a/src/wsi/sdl2/wsi_platform_sdl2.cpp
++++ b/src/wsi/sdl2/wsi_platform_sdl2.cpp
+@@ -15,6 +15,8 @@ namespace dxvk::wsi {
+         "SDL2.dll"
+ #elif defined(__APPLE__)
+         "libSDL2-2.0.0.dylib"
++#elif defined(__ANDROID__)
++        "libSDL2.so"
+ #else
+         "libSDL2-2.0.so.0"
+ #endif
+diff --git a/src/wsi/sdl2/wsi_platform_sdl2.h b/src/wsi/sdl2/wsi_platform_sdl2.h
+index 44f8836..b1c1a99 100644
+--- a/src/wsi/sdl2/wsi_platform_sdl2.h
++++ b/src/wsi/sdl2/wsi_platform_sdl2.h
+@@ -1,6 +1,9 @@
+ #pragma once
+ 
+ #include <SDL.h>
++#ifdef __ANDROID__
++#include <SDL_syswm.h>
++#endif
+ 
+ #include "../wsi_platform.h"
+ 
+diff --git a/src/wsi/sdl2/wsi_platform_sdl2_funcs.h b/src/wsi/sdl2/wsi_platform_sdl2_funcs.h
+index 4396a6b..66af04f 100644
+--- a/src/wsi/sdl2/wsi_platform_sdl2_funcs.h
++++ b/src/wsi/sdl2/wsi_platform_sdl2_funcs.h
+@@ -14,4 +14,7 @@ SDL_PROC(void, SDL_SetWindowSize, (SDL_Window*, int, int))
+ SDL_PROC(SDL_bool, SDL_Vulkan_CreateSurface, (SDL_Window*, VkInstance, VkSurfaceKHR*))
+ SDL_PROC(SDL_bool, SDL_Vulkan_GetInstanceExtensions, (SDL_Window*, unsigned int*, const char**))
+ SDL_PROC(int, SDL_Vulkan_LoadLibrary, (const char*))
++#ifdef __ANDROID__
++SDL_PROC(SDL_bool, SDL_GetWindowWMInfo, (SDL_Window*, SDL_SysWMinfo*))
++#endif
+ #undef SDL_PROC
+diff --git a/src/wsi/sdl2/wsi_window_sdl2.cpp b/src/wsi/sdl2/wsi_window_sdl2.cpp
+index e0c48fd..a1999dd 100644
+--- a/src/wsi/sdl2/wsi_window_sdl2.cpp
++++ b/src/wsi/sdl2/wsi_window_sdl2.cpp
+@@ -10,6 +10,10 @@
+ 
+ #include <windows.h>
+ #include <SDL_vulkan.h>
++#ifdef __ANDROID__
++#include <android/native_window.h>
++#include <vulkan/vulkan_android.h>
++#endif
+ 
+ namespace dxvk::wsi {
+ 
+@@ -163,9 +167,26 @@ namespace dxvk::wsi {
+           VkSurfaceKHR*             pSurface) {
+     SDL_Window* window = fromHwnd(hWindow);
+ 
++#ifdef __ANDROID__
++    // Android port: create the surface through the instance's own vkGetInstanceProcAddr. The Vulkan library may
++    // be a bundled driver (Turnip, loaded by the host through adrenotools) that SDL knows nothing about; and a
++    // window whose surface Android has destroyed yields an error instead of a crash in the loader.
++    SDL_SysWMinfo info;
++    SDL_VERSION(&info.version);
++    if (!SDL_GetWindowWMInfo(window, &info) || !info.info.android.window)
++      return VK_ERROR_SURFACE_LOST_KHR;
++    auto create = reinterpret_cast<PFN_vkCreateAndroidSurfaceKHR>(
++      pfnVkGetInstanceProcAddr(instance, "vkCreateAndroidSurfaceKHR"));
++    if (!create)
++      return VK_ERROR_EXTENSION_NOT_PRESENT;
++    VkAndroidSurfaceCreateInfoKHR ci = { VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR };
++    ci.window = info.info.android.window;
++    return create(instance, &ci, nullptr, pSurface);
++#else
+     return SDL_Vulkan_CreateSurface(window, instance, pSurface)
+          ? VK_SUCCESS
+          : VK_ERROR_OUT_OF_HOST_MEMORY;
++#endif
+   }
+ 
+ }
