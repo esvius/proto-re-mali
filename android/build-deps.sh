@@ -15,7 +15,9 @@ JOBS=${JOBS:-$(nproc)}
 
 SDL2_TAG=release-2.30.9
 FAUDIO_TAG=25.10
-DXVK_TAG=v2.5.3
+# DXVK: fbraz3's 2.6-based fork + the Vulkan 1.1 / Mali-G76 patch series (android/patches/dxvk-vk11/), pinned.
+DXVK_REPO=https://github.com/fbraz3/dxvk.git
+DXVK_COMMIT=46a3bc018bcae408d49d3c500e4e536a11f6789a
 
 case $ABI in
     arm64-v8a) TRIPLE=aarch64-linux-android; CPU_FAMILY=aarch64; CPU=armv8-a ;;
@@ -29,14 +31,29 @@ fetch() {  # fetch <dir> <url> <tag>
 mkdir -p "$SRC" "$PREFIX"
 fetch SDL2 https://github.com/libsdl-org/SDL.git $SDL2_TAG
 fetch FAudio https://github.com/FNA-XNA/FAudio.git $FAUDIO_TAG
-fetch dxvk https://github.com/doitsujin/dxvk.git $DXVK_TAG
+if [ ! -d "$SRC/dxvk/.git" ]; then
+    git init -q "$SRC/dxvk"
+    git -C "$SRC/dxvk" remote add origin "$DXVK_REPO"
+    git -C "$SRC/dxvk" fetch -q --depth 1 origin "$DXVK_COMMIT"
+    git -C "$SRC/dxvk" checkout -q FETCH_HEAD
+    git -C "$SRC/dxvk" submodule update --init --depth 1 include/vulkan include/spirv include/native/directx subprojects/libdisplay-info
+fi
 
 # Android patches (android/patches/<project>-*.patch), applied once.
-for proj in SDL2 FAudio dxvk; do
+for proj in SDL2 FAudio; do
     for p in "$(dirname "$0")"/patches/"${proj,,}"-*.patch; do
         [ -e "$p" ] || continue
         git -C "$SRC/$proj" apply --check "$p" 2>/dev/null && git -C "$SRC/$proj" apply "$p" && echo "applied $(basename "$p")"
     done
+done
+
+# DXVK patch series, in file-name order. Each patch must apply (exactly, or with one line of context dropped) or the
+# build fails: an unpatched DXVK must never ship. Already-applied patches are skipped, so reruns are safe.
+for p in "$(dirname "$0")"/patches/dxvk-vk11/*.patch; do
+    if git -C "$SRC/dxvk" apply --reverse --check "$p" 2>/dev/null; then echo "already applied $(basename "$p")"
+    elif git -C "$SRC/dxvk" apply --check "$p" 2>/dev/null; then git -C "$SRC/dxvk" apply "$p"; echo "applied $(basename "$p")"
+    elif git -C "$SRC/dxvk" apply --check -C1 "$p" 2>/dev/null; then git -C "$SRC/dxvk" apply -C1 "$p"; echo "applied (-C1) $(basename "$p")"
+    else echo "FAILED to apply $(basename "$p")" >&2; exit 1; fi
 done
 
 CMAKE_ANDROID=(-G Ninja -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" -DANDROID_ABI="$ABI"
