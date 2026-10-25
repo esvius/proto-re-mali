@@ -11,6 +11,8 @@ on:
 jobs:
   build:
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     strategy:
       matrix:
         abi: [arm64-v8a, x86_64]
@@ -39,6 +41,20 @@ jobs:
           export PATH=$HOME/.local/bin:$PATH
           echo "NDK: $ANDROID_NDK_HOME"
           android/build-deps.sh ${{ matrix.abi }} src out/${{ matrix.abi }}
+
+      - name: Publish stripped arm64 d3d9 lib to branch build-output
+        if: matrix.abi == 'arm64-v8a'
+        run: |
+          STRIP=$(ls "$ANDROID_NDK_LATEST_HOME"/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip)
+          mkdir -p /tmp/pub
+          cp out/arm64-v8a/lib/libdxvk_d3d9.so /tmp/pub/
+          "$STRIP" --strip-unneeded /tmp/pub/libdxvk_d3d9.so
+          cd /tmp/pub
+          git init -q
+          git checkout -q -b build-output
+          git add libdxvk_d3d9.so
+          git -c user.name=ci -c user.email=ci@users.noreply.github.com commit -qm "libdxvk_d3d9.so from ${{ github.sha }}"
+          git push -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}" build-output
 
       - uses: actions/upload-artifact@v4
         with:
