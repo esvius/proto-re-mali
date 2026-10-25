@@ -1,0 +1,311 @@
+diff --git a/src/dxvk/dxvk_cmdlist.cpp b/src/dxvk/dxvk_cmdlist.cpp
+index 28e6b35..40286a5 100644
+--- a/src/dxvk/dxvk_cmdlist.cpp
++++ b/src/dxvk/dxvk_cmdlist.cpp
+@@ -1,5 +1,6 @@
+ #include "dxvk_cmdlist.h"
+ #include "dxvk_device.h"
++#include "dxvk_legacy_renderpass.h"
+ 
+ namespace dxvk {
+ 
+@@ -545,4 +546,17 @@ namespace dxvk {
+       : m_graphicsPool->getCommandBuffer(type);
+   }
+ 
++
++  void DxvkCommandList::cmdBeginRenderingLegacy(
++    const VkRenderingInfo*        pRenderingInfo) {
++    auto* pool = m_device->legacyRenderPasses();
++
++    if (unlikely(!pool)) {
++      Logger::err("vkCmdBeginRendering is unavailable and no legacy render pass pool exists");
++      return;
++    }
++
++    pool->beginRendering(getCmdBuffer(), pRenderingInfo);
++  }
++
+ }
+diff --git a/src/dxvk/dxvk_cmdlist.h b/src/dxvk/dxvk_cmdlist.h
+index 0e60534..55bae92 100644
+--- a/src/dxvk/dxvk_cmdlist.h
++++ b/src/dxvk/dxvk_cmdlist.h
+@@ -567,9 +567,19 @@ namespace dxvk {
+       const VkRenderingInfo*        pRenderingInfo) {
+       m_cmd.execCommands = true;
+ 
++      // Drivers without VK_KHR_dynamic_rendering (Mali-G76, Vulkan 1.1):
++      // emulate with a legacy render pass instead of calling a null pointer.
++      if (unlikely(!m_vkd->vkCmdBeginRendering)) {
++        cmdBeginRenderingLegacy(pRenderingInfo);
++        return;
++      }
++
+       m_vkd->vkCmdBeginRendering(getCmdBuffer(), pRenderingInfo);
+     }
+ 
++    void cmdBeginRenderingLegacy(
++      const VkRenderingInfo*        pRenderingInfo);
++
+ 
+     // GeneralsX @bugfix Android port 30/07/2026 legacy VkRenderPass/
+     // VkFramebuffer path used on devices without VK_KHR_dynamic_rendering
+@@ -1033,6 +1043,11 @@ namespace dxvk {
+     
+     
+     void cmdEndRendering() {
++      if (unlikely(!m_vkd->vkCmdEndRendering)) {
++        m_vkd->vkCmdEndRenderPass(getCmdBuffer());
++        return;
++      }
++
+       m_vkd->vkCmdEndRendering(getCmdBuffer());
+     }
+ 
+diff --git a/src/dxvk/dxvk_legacy_renderpass.cpp b/src/dxvk/dxvk_legacy_renderpass.cpp
+index bff4df0..9627a69 100644
+--- a/src/dxvk/dxvk_legacy_renderpass.cpp
++++ b/src/dxvk/dxvk_legacy_renderpass.cpp
+@@ -9,9 +9,154 @@ namespace dxvk {
+   }
+ 
+ 
++  namespace {
++    struct LegacyViewInfo { VkFormat format; uint64_t serial; };
++    dxvk::mutex g_viewMutex;
++    std::unordered_map<VkImageView, LegacyViewInfo> g_views;
++    uint64_t g_viewSerial = 0;
++  }
++
++
++  void DxvkLegacyRenderPassPool::registerView(VkImageView view, VkFormat format) {
++    std::lock_guard<dxvk::mutex> lock(g_viewMutex);
++    g_views[view] = LegacyViewInfo { format, ++g_viewSerial };
++  }
++
++
++  void DxvkLegacyRenderPassPool::beginRendering(
++          VkCommandBuffer           cmd,
++    const VkRenderingInfo*          ri) {
++    auto vk = m_device->vkd();
++
++    DxvkLegacyRenderPassKey key;
++    EmuFbKey fbKey;
++    std::array<VkClearValue, MaxNumRenderTargets + 1> clears = { };
++    uint32_t attachmentCount = 0;
++
++    auto lookup = [&] (VkImageView view, VkFormat& format, uint64_t& serial) {
++      std::lock_guard<dxvk::mutex> lock(g_viewMutex);
++      auto it = g_views.find(view);
++      if (it == g_views.end())
++        return false;
++      format = it->second.format;
++      serial = it->second.serial;
++      return true;
++    };
++
++    for (uint32_t i = 0; i < ri->colorAttachmentCount && i < MaxNumRenderTargets; i++) {
++      const auto& att = ri->pColorAttachments[i];
++
++      if (!att.imageView)
++        continue;
++
++      VkFormat format; uint64_t serial;
++
++      if (!lookup(att.imageView, format, serial)) {
++        Logger::err("DxvkLegacyRenderPass: unknown color view in emulated rendering");
++        return;
++      }
++
++      key.colorFormats[i] = format;
++      key.colorLoadOps[i] = att.loadOp;
++      key.colorLayouts[i] = att.imageLayout;
++
++      fbKey.views[attachmentCount]   = att.imageView;
++      fbKey.serials[attachmentCount] = serial;
++      clears[attachmentCount]        = att.clearValue;
++      attachmentCount++;
++    }
++
++    const VkRenderingAttachmentInfo* depth = ri->pDepthAttachment;
++    const VkRenderingAttachmentInfo* stencil = ri->pStencilAttachment;
++    const VkRenderingAttachmentInfo* ds = depth ? depth : stencil;
++
++    if (ds && ds->imageView) {
++      VkFormat format; uint64_t serial;
++
++      if (!lookup(ds->imageView, format, serial)) {
++        Logger::err("DxvkLegacyRenderPass: unknown depth view in emulated rendering");
++        return;
++      }
++
++      key.depthStencilFormat = format;
++      key.depthLoadOp        = depth   ? depth->loadOp   : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
++      key.stencilLoadOp      = stencil ? stencil->loadOp : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
++      key.depthStencilLayout = ds->imageLayout;
++
++      fbKey.views[attachmentCount]   = ds->imageView;
++      fbKey.serials[attachmentCount] = serial;
++      clears[attachmentCount].depthStencil.depth =
++        depth ? depth->clearValue.depthStencil.depth : 0.0f;
++      clears[attachmentCount].depthStencil.stencil =
++        stencil ? stencil->clearValue.depthStencil.stencil : 0u;
++      attachmentCount++;
++    }
++
++    VkRenderPass renderPass;
++    VkFramebuffer framebuffer;
++
++    {
++      std::lock_guard<dxvk::mutex> lock(m_mutex);
++
++      auto rp = m_renderPasses.find(key);
++
++      if (rp != m_renderPasses.end()) {
++        renderPass = rp->second;
++      } else {
++        renderPass = createRenderPass(key);
++        m_renderPasses.insert({ key, renderPass });
++      }
++
++      if (!renderPass)
++        return;
++
++      fbKey.renderPass = renderPass;
++      fbKey.width  = ri->renderArea.offset.x + ri->renderArea.extent.width;
++      fbKey.height = ri->renderArea.offset.y + ri->renderArea.extent.height;
++      fbKey.layers = std::max(ri->layerCount, 1u);
++
++      auto fb = m_emuFramebuffers.find(fbKey);
++
++      if (fb != m_emuFramebuffers.end()) {
++        framebuffer = fb->second;
++      } else {
++        VkFramebufferCreateInfo info = { VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO };
++        info.renderPass      = renderPass;
++        info.attachmentCount = attachmentCount;
++        info.pAttachments    = fbKey.views.data();
++        info.width           = fbKey.width;
++        info.height          = fbKey.height;
++        info.layers          = fbKey.layers;
++
++        framebuffer = VK_NULL_HANDLE;
++        VkResult vr = vk->vkCreateFramebuffer(vk->device(), &info, nullptr, &framebuffer);
++
++        if (vr != VK_SUCCESS) {
++          Logger::err(str::format("DxvkLegacyRenderPass: emulated framebuffer failed: ", vr));
++          return;
++        }
++
++        m_emuFramebuffers.insert({ fbKey, framebuffer });
++      }
++    }
++
++    VkRenderPassBeginInfo begin = { VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
++    begin.renderPass      = renderPass;
++    begin.framebuffer     = framebuffer;
++    begin.renderArea      = ri->renderArea;
++    begin.clearValueCount = attachmentCount;
++    begin.pClearValues    = clears.data();
++
++    vk->vkCmdBeginRenderPass(cmd, &begin, VK_SUBPASS_CONTENTS_INLINE);
++  }
++
++
+   DxvkLegacyRenderPassPool::~DxvkLegacyRenderPassPool() {
+     auto vk = m_device->vkd();
+ 
++    for (const auto& pair : m_emuFramebuffers)
++      vk->vkDestroyFramebuffer(vk->device(), pair.second, nullptr);
++
+     for (const auto& pair : m_framebuffers)
+       vk->vkDestroyFramebuffer(vk->device(), pair.second, nullptr);
+ 
+diff --git a/src/dxvk/dxvk_legacy_renderpass.h b/src/dxvk/dxvk_legacy_renderpass.h
+index f27870b..2b6a861 100644
+--- a/src/dxvk/dxvk_legacy_renderpass.h
++++ b/src/dxvk/dxvk_legacy_renderpass.h
+@@ -167,6 +167,27 @@ namespace dxvk {
+             VkRenderPass              renderPass,
+       const DxvkFramebufferInfo&     framebufferInfo);
+ 
++    /**
++     * \brief Records the format of a freshly created image view
++     *
++     * VkRenderingAttachmentInfo only carries the view handle, so the
++     * emulation of vkCmdBeginRendering below needs to look the format
++     * up. Each registration gets a new serial so that cached
++     * framebuffers of a destroyed view are never matched again if the
++     * driver hands out the same handle value for a new view.
++     */
++    static void registerView(VkImageView view, VkFormat format);
++
++    /**
++     * \brief Emulates vkCmdBeginRendering with a legacy render pass
++     *
++     * Used by every helper that still starts a dynamic rendering pass
++     * on drivers that lack VK_KHR_dynamic_rendering.
++     */
++    void beginRendering(
++            VkCommandBuffer           cmd,
++      const VkRenderingInfo*          pRenderingInfo);
++
+   private:
+ 
+     DxvkDevice* m_device;
+@@ -183,6 +204,33 @@ namespace dxvk {
+             VkRenderPass              renderPass,
+       const DxvkFramebufferInfo&     framebufferInfo);
+ 
++    struct EmuFbKey {
++      VkRenderPass renderPass = VK_NULL_HANDLE;
++      std::array<VkImageView, MaxNumRenderTargets + 1> views = { };
++      std::array<uint64_t,    MaxNumRenderTargets + 1> serials = { };
++      uint32_t width = 0, height = 0, layers = 0;
++
++      size_t hash() const {
++        DxvkHashState state;
++        state.add(uint64_t(renderPass));
++        for (size_t i = 0; i < views.size(); i++) {
++          state.add(uint64_t(views[i]));
++          state.add(serials[i]);
++        }
++        state.add(width);
++        state.add(height);
++        state.add(layers);
++        return state;
++      }
++
++      bool eq(const EmuFbKey& o) const {
++        return renderPass == o.renderPass && views == o.views && serials == o.serials
++            && width == o.width && height == o.height && layers == o.layers;
++      }
++    };
++
++    std::unordered_map<EmuFbKey, VkFramebuffer, DxvkHash, DxvkEq> m_emuFramebuffers;
++
+   };
+ 
+ }
+diff --git a/src/dxvk/dxvk_memory.cpp b/src/dxvk/dxvk_memory.cpp
+index b6a61c6..b3d6fb3 100644
+--- a/src/dxvk/dxvk_memory.cpp
++++ b/src/dxvk/dxvk_memory.cpp
+@@ -6,6 +6,7 @@
+ 
+ #include "dxvk_device.h"
+ #include "dxvk_memory.h"
++#include "dxvk_legacy_renderpass.h"
+ #include "dxvk_sparse.h"
+ 
+ namespace dxvk {
+@@ -139,6 +140,8 @@ namespace dxvk {
+       throw DxvkError(str::format("Failed to create Vulkan image view: ", vr));
+ 
+     m_views.insert({ key, view });
++    // Format lookup for the dynamic rendering emulation (legacy render passes)
++    DxvkLegacyRenderPassPool::registerView(view, key.format);
+     return view;
+   }
+ 
