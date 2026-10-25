@@ -111,7 +111,8 @@ EOF
 rm -rf "$SRC/build/dxvk-$ABI"
 meson setup "$SRC/build/dxvk-$ABI" "$SRC/dxvk" --cross-file "$CROSS" --buildtype release --prefix "$PREFIX" \
       -Denable_d3d9=true -Denable_d3d8=false -Denable_d3d10=false -Denable_d3d11=false -Denable_dxgi=false \
-      -Ddxvk_native_wsi=sdl2
+      -Ddxvk_native_wsi=sdl2 \
+      -Dcpp_args=-DVK_ENABLE_BETA_EXTENSIONS
 ninja -C "$SRC/build/dxvk-$ABI" -j "$JOBS"
 ninja -C "$SRC/build/dxvk-$ABI" install
 
