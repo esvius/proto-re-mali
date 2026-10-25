@@ -22,6 +22,7 @@ on_exit() {
 trap on_exit EXIT
 
 ABI=${1:?abi}
+PATCH_DIR=$(realpath "$(dirname "$0")")/patches   # absolute: the patch loops below run git -C <dir>
 SRC=$(realpath -m "${2:?source dir}")
 PREFIX=$(realpath -m "${3:?install prefix}")
 NDK=${ANDROID_NDK_HOME:-${ANDROID_NDK_LATEST_HOME:?set ANDROID_NDK_HOME}}
@@ -56,7 +57,7 @@ fi
 
 # Android patches (android/patches/<project>-*.patch), applied once.
 for proj in SDL2 FAudio; do
-    for p in "$(dirname "$0")"/patches/"${proj,,}"-*.patch; do
+    for p in "$PATCH_DIR"/"${proj,,}"-*.patch; do
         [ -e "$p" ] || continue
         git -C "$SRC/$proj" apply --check "$p" 2>/dev/null && git -C "$SRC/$proj" apply "$p" && echo "applied $(basename "$p")"
     done
@@ -64,7 +65,7 @@ done
 
 # DXVK patch series, in file-name order. Each patch must apply (exactly, or with one line of context dropped) or the
 # build fails: an unpatched DXVK must never ship. Already-applied patches are skipped, so reruns are safe.
-for p in "$(dirname "$0")"/patches/dxvk-vk11/*.patch; do
+for p in "$PATCH_DIR"/dxvk-vk11/*.patch; do
     if git -C "$SRC/dxvk" apply --reverse --check "$p" 2>/dev/null; then echo "already applied $(basename "$p")"
     elif git -C "$SRC/dxvk" apply --check "$p" 2>/dev/null; then git -C "$SRC/dxvk" apply "$p"; echo "applied $(basename "$p")"
     elif git -C "$SRC/dxvk" apply --check -C1 "$p" 2>/dev/null; then git -C "$SRC/dxvk" apply -C1 "$p"; echo "applied (-C1) $(basename "$p")"
