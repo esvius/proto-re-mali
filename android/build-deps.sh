@@ -6,6 +6,21 @@
 # Needs ANDROID_NDK_HOME (or ANDROID_NDK_LATEST_HOME), cmake, ninja, meson, glslang, git.
 set -euo pipefail
 
+# CI diagnostics: keep a log and, when the script fails, print its interesting lines as GitHub error annotations.
+BUILD_LOG=$(mktemp)
+exec > >(tee "$BUILD_LOG") 2>&1
+on_exit() {
+    local rc=$?
+    if [ $rc -ne 0 ] && [ -n "${GITHUB_ACTIONS:-}" ]; then
+        sleep 1
+        enc() { sed ':a;N;$!ba;s/%/%25/g;s/\r/%0D/g;s/\n/%0A/g'; }
+        echo "::error title=build-deps errors::$(grep -nEi 'error|failed|fatal|no such|not found' "$BUILD_LOG" | tail -n 15 | cut -c1-300 | enc)"
+        echo "::error title=build-deps tail::$(tail -n 25 "$BUILD_LOG" | cut -c1-300 | enc)"
+    fi
+    exit $rc
+}
+trap on_exit EXIT
+
 ABI=${1:?abi}
 SRC=$(realpath -m "${2:?source dir}")
 PREFIX=$(realpath -m "${3:?install prefix}")
