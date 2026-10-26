@@ -1,0 +1,91 @@
+diff --git a/src/dxvk/dxvk_presenter.cpp b/src/dxvk/dxvk_presenter.cpp
+index c2324ae..2b491d3 100644
+--- a/src/dxvk/dxvk_presenter.cpp
++++ b/src/dxvk/dxvk_presenter.cpp
+@@ -105,6 +105,9 @@ namespace dxvk {
+         sync.acquire, VK_NULL_HANDLE, &m_imageIndex);
+     }
+ 
++    if (m_acquireStatus == VK_SUBOPTIMAL_KHR && m_swapchain && suboptimalIsHarmless())
++      m_acquireStatus = VK_SUCCESS;
++
+     // This is a normal occurence, but may be useful for
+     // debugging purposes in case WSI goes wrong somehow.
+     if (m_acquireStatus != VK_SUCCESS && m_swapchain)
+@@ -201,6 +204,9 @@ namespace dxvk {
+     VkResult status = m_vkd->vkQueuePresentKHR(
+       m_device->queues().graphics.queueHandle, &info);
+ 
++    if (status == VK_SUBOPTIMAL_KHR && suboptimalIsHarmless())
++      status = VK_SUCCESS;
++
+     // Maintain valid state if presentation succeeded, even if we want to
+     // recreate the swapchain. Spec says that 'queue' operations, i.e. the
+     // semaphore and fence signals, still happen if present fails with
+@@ -505,6 +511,29 @@ namespace dxvk {
+   }
+ 
+ 
++  bool Presenter::suboptimalIsHarmless() {
++    // Ask the surface for its size only every few frames, this is a
++    // query into the window system. A real resize or rotation also
++    // produces VK_ERROR_OUT_OF_DATE_KHR, which is handled as before.
++    if ((m_suboptimalCounter++ % 16u) != 0u)
++      return true;
++
++    VkSurfaceCapabilitiesKHR caps = { };
++
++    VkResult vr = m_vki->vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
++      m_device->adapter()->handle(), m_surface, &caps);
++
++    if (vr != VK_SUCCESS)
++      return false;
++
++    if (caps.currentExtent.width == std::numeric_limits<uint32_t>::max())
++      return true;
++
++    return caps.currentExtent.width  == m_swapchainExtent.width
++        && caps.currentExtent.height == m_swapchainExtent.height;
++  }
++
++
+   VkResult Presenter::recreateSwapChain() {
+     VkResult vr;
+ 
+@@ -729,6 +758,9 @@ namespace dxvk {
+       Logger::err(str::format("Presenter: Failed to create Vulkan swapchain: ", status));
+       return status;
+     }
++
++    m_swapchainExtent = imageExtent;
++    m_suboptimalCounter = 0;
+     
+     // Import actual swap chain images
+     std::vector<VkImage> images;
+diff --git a/src/dxvk/dxvk_presenter.h b/src/dxvk/dxvk_presenter.h
+index 7caf682..e8c031b 100644
+--- a/src/dxvk/dxvk_presenter.h
++++ b/src/dxvk/dxvk_presenter.h
+@@ -289,6 +289,13 @@ namespace dxvk {
+     bool                        m_dirtySwapchain = false;
+     bool                        m_dirtySurface = false;
+ 
++    // Android reports VK_SUBOPTIMAL_KHR on every frame while the display is
++    // rotated against the swap chain's pre-transform (landscape). Recreating
++    // the swap chain each time costs a GPU idle wait per frame, so suboptimal
++    // is only acted on if the surface size really differs from ours.
++    VkExtent2D                  m_swapchainExtent = { };
++    uint32_t                    m_suboptimalCounter = 0;
++
+     VkPresentModeKHR            m_presentMode = VK_PRESENT_MODE_FIFO_KHR;
+ 
+     uint32_t                    m_imageIndex = 0;
+@@ -326,6 +333,8 @@ namespace dxvk {
+ 
+     VkResult recreateSwapChain();
+ 
++    bool suboptimalIsHarmless();
++
+     VkResult createSwapChain();
+ 
+     VkResult getSupportedFormats(
