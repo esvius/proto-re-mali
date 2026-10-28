@@ -16,6 +16,8 @@ import android.graphics.RectF;
 import android.graphics.Typeface;
 import android.hardware.input.InputManager;
 import android.os.Build;
+import android.os.Handler;
+import android.os.Looper;
 import android.view.InputDevice;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
@@ -68,7 +70,7 @@ public class TouchControls extends View implements InputManager.InputDeviceListe
         float customX = -1, customY = -1;
         float size = 1;  // the layout editor's per-button size factor
         boolean quickPower;  // DISGUISE / ATK PWR / DEFENSE / SENSE: shown only with the "Power buttons" setting
-        // POWERS and DISGUISE hold a selection wheel open: sliding the finger that holds the button moves the mouse,
+        // DISGUISE holds a selection wheel open: sliding the finger that holds the button moves the mouse,
         // which is how the game picks an entry, so one thumb is enough. fx/fy: where that finger is.
         final boolean wheel;
         float fx, fy;
@@ -88,7 +90,7 @@ public class TouchControls extends View implements InputManager.InputDeviceListe
             this.gameOnly = gameOnly;
             this.quickPower = keycode == KeyEvent.KEYCODE_F || keycode == KeyEvent.KEYCODE_1
                     || keycode == KeyEvent.KEYCODE_3 || keycode == KeyEvent.KEYCODE_4;
-            this.wheel = keycode == KeyEvent.KEYCODE_R || keycode == KeyEvent.KEYCODE_F;
+            this.wheel = keycode == KeyEvent.KEYCODE_F;
         }
 
         boolean hit(float x, float y) {
@@ -207,6 +209,19 @@ public class TouchControls extends View implements InputManager.InputDeviceListe
     private float lookX, lookY, lastMouseX, lastMouseY;
     private int mouseState = 0;
     private final Map<Integer, Button> pointerButton = new HashMap<>();
+
+    // ---- power mode ----
+    // POWERS toggles it: the game's power wheel is held open (R), every control but GAME/MENU, POWERS, ESC, ENTER and
+    // the gear is hidden, and the wheel's entries show again as buttons on the right, in the same places as in the
+    // game's wheel. A tap on one points the game's mouse cursor at that entry and lets go of R, which selects it.
+    private boolean powerMode, powerBusy;
+    private final Handler ui = new Handler(Looper.getMainLooper());
+    // direction of each wheel entry from the wheel's centre, in degrees, clockwise from the right (screen y is down),
+    // measured on the game's 11 slots
+    private static final float[] SLOT_DEG = {-91.6f, -50.5f, -13.2f, 18.6f, 43.4f, 74.9f, 105.9f, 137.5f, 161.5f,
+            -166.7f, -127.9f};
+    private final float[] slotX = new float[SLOT_DEG.length], slotY = new float[SLOT_DEG.length];
+    private float slotR;
 
     public TouchControls(Context context) {
         super(context);
@@ -485,7 +500,49 @@ public class TouchControls extends View implements InputManager.InputDeviceListe
         stickY = knobY = stickHomeY;
     }
 
+    private void setPowerMode(boolean on) {
+        if (on == powerMode) return;
+        powerMode = on;
+        key(KeyEvent.KEYCODE_R, on);
+    }
+
+    private void layoutPowerSlots() {
+        float ringR = 112 * density;
+        slotR = 25 * density;
+        float cx = getWidth() - 40 * density - ringR - slotR;
+        float cy = getHeight() * 0.56f;
+        for (int i = 0; i < SLOT_DEG.length; i++) {
+            double a = Math.toRadians(SLOT_DEG[i]);
+            slotX[i] = cx + (float) Math.cos(a) * ringR;
+            slotY[i] = cy + (float) Math.sin(a) * ringR;
+        }
+    }
+
+    private int slotAt(float x, float y) {
+        layoutPowerSlots();
+        for (int i = 0; i < SLOT_DEG.length; i++) {
+            float dx = x - slotX[i], dy = y - slotY[i];
+            if (dx * dx + dy * dy <= slotR * slotR * 1.4f) return i;
+        }
+        return -1;
+    }
+
+    /** Pushes the game's mouse cursor out towards one wheel entry, then lets go of R so the game takes it. */
+    private void pickPower(int slot) {
+        if (powerBusy) return;
+        powerBusy = true;
+        double a = Math.toRadians(SLOT_DEG[slot]);
+        final float ux = (float) Math.cos(a) * 140, uy = (float) Math.sin(a) * 140;
+        for (int k = 0; k < 10; k++) ui.postDelayed(() -> mouseMoveBy(ux, uy), k * 16L);
+        ui.postDelayed(() -> {
+            setPowerMode(false);
+            powerBusy = false;
+            invalidate();
+        }, 320);
+    }
+
     private void releaseAll() {
+        setPowerMode(false);
         for (Button b : buttons) if (b.pointer >= 0) release(b);
         if (stickPointer >= 0) releaseStick();
         setRun(false, false);
@@ -495,6 +552,10 @@ public class TouchControls extends View implements InputManager.InputDeviceListe
 
     private boolean visible(Button b) {
         if (b.quickPower && !powerButtons) return false;  // off by default: the screen was too busy
+        if (powerMode && !editing) {
+            return b.keycode == KeyEvent.KEYCODE_R || b.keycode == KeyEvent.KEYCODE_ESCAPE
+                    || b.keycode == KeyEvent.KEYCODE_ENTER;
+        }
         return editing || (!controlsHidden() && (gameMode || !b.gameOnly));
     }
 
@@ -617,6 +678,13 @@ public class TouchControls extends View implements InputManager.InputDeviceListe
                     modePointer = id;
                     break;
                 }
+                if (powerMode) {
+                    int slot = slotAt(x, y);
+                    if (slot >= 0) {
+                        pickPower(slot);
+                        break;
+                    }
+                }
                 Button hit = null;
                 for (Button b : buttons) {
                     if (visible(b) && b.pointer < 0 && b.hit(x, y)) {
@@ -624,10 +692,15 @@ public class TouchControls extends View implements InputManager.InputDeviceListe
                         break;
                     }
                 }
-                if (hit != null) {
+                if (hit != null && hit.keycode == KeyEvent.KEYCODE_R) {
+                    if (!powerBusy) setPowerMode(!powerMode);  // POWERS only toggles power mode
+                } else if (hit != null) {
+                    if (powerMode) setPowerMode(false);  // ESC / ENTER end it
                     hit.fx = x;
                     hit.fy = y;
                     press(hit, id);
+                } else if (powerMode) {
+                    // nothing else is shown, so nothing else reacts
                 } else if (gameMode && !controlsHidden() && stickPointer < 0 && x < getWidth() * 0.4f
                         && y > getHeight() * 0.35f) {
                     stickPointer = id;
@@ -795,8 +868,8 @@ public class TouchControls extends View implements InputManager.InputDeviceListe
     }
 
     private void drawButton(Canvas c, Button b) {
-        final boolean down = b.pointer >= 0;
-        if (down && b.wheel) {  // where the held finger points the wheel
+        final boolean down = b.pointer >= 0 || (powerMode && b.keycode == KeyEvent.KEYCODE_R);
+        if (b.pointer >= 0 && b.wheel) {  // where the held finger points the wheel
             edge.setStrokeWidth(3 * density);
             edge.setColor(0xccffffff);
             c.drawLine(b.cx, b.cy, b.fx, b.fy, edge);
@@ -1089,11 +1162,35 @@ public class TouchControls extends View implements InputManager.InputDeviceListe
         }
         if (!controlsHidden()) drawPill(canvas, modeRect, gameMode ? "GAME" : "MENU", gameMode);
         drawGear(canvas);
-        if (showFps) drawPerf(canvas);
-        if (gameMode && !controlsHidden()) drawStick(canvas);
+        if (showFps && !powerMode) drawPerf(canvas);
+        if (gameMode && !controlsHidden() && !powerMode) drawStick(canvas);
         for (Button b : buttons) {
             if (visible(b)) drawButton(canvas, b);
         }
+        if (powerMode) drawPowerSlots(canvas);
         if (panelOpen) drawPanel(canvas);
+    }
+
+    private void drawPowerSlots(Canvas c) {
+        layoutPowerSlots();
+        text.setTextAlign(Paint.Align.CENTER);
+        text.setTextSize(13 * density);
+        text.setColor(0xffffe9e4);
+        c.drawText("TAP A POWER  \u00b7  TAP POWERS TO CANCEL", getWidth() / 2f, 30 * density, text);
+        for (int i = 0; i < SLOT_DEG.length; i++) {
+            hexagon(slotX[i], slotY[i], slotR);
+            fill.setStyle(Paint.Style.FILL);
+            fill.setColor(alpha(0xa00b0b0b, 1f));
+            c.drawPath(path, fill);
+            glow.setStrokeWidth(4 * density);
+            glow.setColor(alpha(RED, 0.55f));
+            c.drawPath(path, glow);
+            edge.setStrokeWidth(1.8f * density);
+            edge.setColor(alpha(RED, 1f));
+            c.drawPath(path, edge);
+            text.setTextSize(Math.min(14 * density, slotR * 0.7f));
+            text.setColor(alpha(0xffffd6d0, 1f));
+            c.drawText(String.valueOf(i + 1), slotX[i], slotY[i] + text.getTextSize() * 0.36f, text);
+        }
     }
 }
