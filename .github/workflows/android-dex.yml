@@ -1,0 +1,38 @@
+# Builds classes.dex (SDL's Java activity + the app's Java) and publishes it to the build-output-dex branch.
+name: android-dex
+
+on:
+  push:
+    paths: [android/java/**, .github/workflows/android-dex.yml]
+  workflow_dispatch:
+
+jobs:
+  dex:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build classes.dex
+        run: |
+          SDK=${ANDROID_HOME:-$ANDROID_SDK_ROOT}
+          BT=$(ls -d "$SDK"/build-tools/* | sort -V | tail -1)
+          PJ=$(ls -d "$SDK"/platforms/android-*/ | sort -V | tail -1)android.jar
+          echo "build-tools: $BT, platform: $PJ"
+          git clone -q --depth 1 --branch release-2.30.9 https://github.com/libsdl-org/SDL.git /tmp/SDL2
+          mkdir -p /tmp/classes /tmp/dex
+          javac --release 11 -nowarn -cp "$PJ" -d /tmp/classes \
+            /tmp/SDL2/android-project/app/src/main/java/org/libsdl/app/*.java android/java/com/protore/game/*.java
+          "$BT/d8" --release --min-api 26 --lib "$PJ" --output /tmp/dex $(find /tmp/classes -name '*.class')
+          ls -l /tmp/dex
+
+      - name: Publish classes.dex to branch build-output-dex
+        run: |
+          mkdir -p /tmp/pub && cp /tmp/dex/classes.dex /tmp/pub/
+          cd /tmp/pub
+          git init -q
+          git checkout -q -b build-output-dex
+          git add classes.dex
+          git -c user.name=ci -c user.email=ci@users.noreply.github.com commit -qm "classes.dex from ${{ github.sha }}"
+          git push -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}" build-output-dex

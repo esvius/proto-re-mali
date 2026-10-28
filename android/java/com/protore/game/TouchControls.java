@@ -15,7 +15,6 @@ import android.graphics.Path;
 import android.graphics.RectF;
 import android.graphics.Typeface;
 import android.hardware.input.InputManager;
-import android.view.HapticFeedbackConstants;
 import android.os.Build;
 import android.view.InputDevice;
 import android.view.KeyEvent;
@@ -122,7 +121,7 @@ public class TouchControls extends View implements InputManager.InputDeviceListe
     // ---- settings ----
     private final SharedPreferences prefs;
     private float opacity, scale;
-    private boolean vibrate, showFps, hideWithPad, autoRun, invertY, powerButtons;
+    private boolean showFps, hideWithPad, autoRun, invertY, powerButtons;
     private float camGain;
     private boolean padConnected;
 
@@ -146,6 +145,8 @@ public class TouchControls extends View implements InputManager.InputDeviceListe
         }
     }
 
+    private static final String PROJECT_URL = "github.com/esvius/proto-re-mali";
+
     private final Setting[] settings = {
         new Setting("Resolution", "render_height", new String[] {"540p", "720p", "900p", "1080p"},
                 new int[] {540, 720, 900, 1080}, true),
@@ -158,7 +159,6 @@ public class TouchControls extends View implements InputManager.InputDeviceListe
                 new int[] {40, 60, 80, 100}, false),
         new Setting("Button size", "ui_scale", new String[] {"80%", "100%", "120%", "140%"},
                 new int[] {80, 100, 120, 140}, false),
-        new Setting("Vibration", "ui_vibrate", new String[] {"Off", "On"}, new int[] {0, 1}, false),
         new Setting("Show FPS", "ui_fps", new String[] {"Off", "On"}, new int[] {0, 1}, false),
         new Setting("Hide with gamepad", "ui_pad_hide", new String[] {"Off", "On"}, new int[] {0, 1}, false),
         new Setting("Stick edge sprint", "ui_stick_run", new String[] {"Off", "On"}, new int[] {0, 1}, false),
@@ -167,7 +167,7 @@ public class TouchControls extends View implements InputManager.InputDeviceListe
         new Setting("Invert Y", "ui_invert", new String[] {"Off", "On"}, new int[] {0, 1}, false),
         new Setting("Power buttons", "ui_power_buttons", new String[] {"Off", "On"}, new int[] {0, 1}, false),
     };
-    private static final int[] DEFAULTS = {1, 1, 0, 0, 2, 1, 1, 0, 0, 0, 2, 0, 0};
+    private static final int[] DEFAULTS = {1, 1, 0, 0, 2, 1, 0, 0, 0, 2, 0, 0};
     private boolean panelOpen = false, restartNeeded = false;
     private final RectF panel = new RectF(), restartRect = new RectF(), closeRect = new RectF(),
             layoutRect = new RectF();
@@ -273,13 +273,12 @@ public class TouchControls extends View implements InputManager.InputDeviceListe
         cache.clear();
         opacity = settings[4].value() / 100f;
         scale = settings[5].value() / 100f;
-        vibrate = settings[6].value() != 0;
-        showFps = settings[7].value() != 0;
-        hideWithPad = settings[8].value() != 0;
-        autoRun = settings[9].value() != 0;
-        camGain = settings[10].value() / 100f;
-        invertY = settings[11].value() != 0;
-        powerButtons = settings[12].value() != 0;
+        showFps = settings[6].value() != 0;
+        hideWithPad = settings[7].value() != 0;
+        autoRun = settings[8].value() != 0;
+        camGain = settings[9].value() / 100f;
+        invertY = settings[10].value() != 0;
+        powerButtons = settings[11].value() != 0;
         layoutButtons(getWidth(), getHeight());
     }
 
@@ -430,14 +429,10 @@ public class TouchControls extends View implements InputManager.InputDeviceListe
         if (ix != 0 || iy != 0) SDLActivity.onNativeMouse(mouseState, MotionEvent.ACTION_MOVE, ix, iy, true);
     }
 
-    private void buzz() {
-        if (vibrate) performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY);
-    }
 
     private void press(Button b, int pointer) {
         b.pointer = pointer;
         pointerButton.put(pointer, b);
-        buzz();
         if (b.mouseButton != 0) mouseButton(b.mouseButton, true, lastMouseX, lastMouseY);
         else if (b.keycode == KeyEvent.KEYCODE_SHIFT_LEFT) setRun(stickRun, true);
         else key(b.keycode, true);
@@ -518,12 +513,10 @@ public class TouchControls extends View implements InputManager.InputDeviceListe
                 if (doneRect.contains(x, y)) {
                     saveLayout();
                     editing = false;
-                    buzz();
                     break;
                 }
                 if (resetRect.contains(x, y)) {
                     resetLayout();
-                    buzz();
                     break;
                 }
                 if ((selected != null || selectedStick) && (smallerRect.contains(x, y) || biggerRect.contains(x, y))) {
@@ -539,7 +532,6 @@ public class TouchControls extends View implements InputManager.InputDeviceListe
                         stickHomeX = stickX = knobX = sx;
                         stickHomeY = stickY = knobY = sy;
                     }
-                    buzz();
                     break;
                 }
                 for (Button b : buttons) {
@@ -562,7 +554,6 @@ public class TouchControls extends View implements InputManager.InputDeviceListe
                     dragPointer = id;
                     selected = dragButton;
                     selectedStick = dragStick;
-                    buzz();
                 }
                 break;
             case MotionEvent.ACTION_MOVE: {
@@ -682,14 +673,12 @@ public class TouchControls extends View implements InputManager.InputDeviceListe
                     if (gearRect.contains(x, y)) {
                         releaseAll();
                         panelOpen = true;
-                        buzz();
                     }
                 } else if (id == modePointer) {
                     modePointer = -1;
                     if (modeRect.contains(x, y)) {
                         releaseAll();
                         gameMode = !gameMode;
-                        buzz();
                     }
                 } else if (pointerButton.containsKey(id)) {
                     release(pointerButton.get(id));
@@ -731,7 +720,6 @@ public class TouchControls extends View implements InputManager.InputDeviceListe
             Setting s = settings[i];
             s.index = (s.index + delta + s.values.length) % s.values.length;
             prefs.edit().putInt(s.key, s.index).apply();
-            buzz();
             if (s.key.equals("fps_limit")) nativeSetFpsLimit(s.value());  // applies right away
             else if (s.engine) restartNeeded = true;
             if (s.engine) writeEngineSettings();
@@ -900,21 +888,60 @@ public class TouchControls extends View implements InputManager.InputDeviceListe
         c.drawCircle(cx, cy, r * 0.4f, edge);
     }
 
+    // GPU name, driver and Vulkan version as DXVK logged them when it created the device
+    private String gpuName, gpuDriver, vulkanApi;
+    private int gpuInfoTries = 0;
+
+    private void readGpuInfo() {
+        if (gpuName != null || gpuInfoTries++ % 120 != 0) return;
+        File dir = getContext().getExternalFilesDir(null);
+        if (dir == null) return;
+        File log = new File(dir, "app_process64_d3d9.log");
+        if (!log.isFile()) return;
+        try (java.io.BufferedReader r = new java.io.BufferedReader(new java.io.FileReader(log))) {
+            java.util.regex.Pattern pa = java.util.regex.Pattern.compile("^info:\\s+Vulkan API\\s*:\\s*(.+)$");
+            java.util.regex.Pattern pd = java.util.regex.Pattern.compile("^info:\\s+Driver\\s*:\\s*(.+)$");
+            java.util.regex.Pattern pn = java.util.regex.Pattern.compile("^info:\\s+Device\\s*:\\s*(.+)$");
+            String name = null, driver = null, api = null, line;
+            for (int i = 0; i < 400 && (line = r.readLine()) != null; i++) {
+                java.util.regex.Matcher m;
+                if (api == null && (m = pa.matcher(line)).matches()) api = m.group(1).trim();
+                else if (driver == null && (m = pd.matcher(line)).matches()) driver = m.group(1).trim();
+                else if (name == null && (m = pn.matcher(line)).matches()) name = m.group(1).trim();
+                if (name != null && driver != null && api != null) break;
+            }
+            if (name != null) {
+                gpuDriver = driver;
+                vulkanApi = api;
+                gpuName = name;
+            }
+        } catch (Exception ignored) {
+            // the overlay just shows less
+        }
+    }
+
     private void drawPerf(Canvas c) {
-        float fps, ms;
+        float fps;
         int mem;
         try {
             fps = nativeFps();
-            ms = nativeFrameMs();
             mem = nativeMemoryMiB();
         } catch (UnsatisfiedLinkError e) {
             return;
         }
-        String line = String.format("%.0f FPS  %.1f MS  %d MB", fps, ms, mem);
+        readGpuInfo();
         text.setTextSize(13 * density);
         text.setTextAlign(Paint.Align.LEFT);
+        float x = 16 * density, y = 74 * density, step = 16 * density;
         text.setColor(fps >= 50 ? 0xff7dff7a : fps >= 28 ? 0xffffd060 : 0xffff5a4a);
-        c.drawText(line, 16 * density, 74 * density, text);
+        c.drawText(String.format("%.0f FPS", fps), x, y, text);
+        text.setColor(0xffe6dedb);
+        c.drawText(String.format("RAM %d MB", mem), x, y += step, text);
+        if (gpuName != null) {
+            c.drawText("GPU " + gpuName, x, y += step, text);
+            if (gpuDriver != null) c.drawText("Driver " + gpuDriver, x, y += step, text);
+            if (vulkanApi != null) c.drawText("Vulkan " + vulkanApi, x, y += step, text);
+        }
         text.setTextAlign(Paint.Align.CENTER);
     }
 
@@ -933,13 +960,11 @@ public class TouchControls extends View implements InputManager.InputDeviceListe
         text.setTextSize(20 * density);
         text.setColor(RED);
         c.drawText("SETTINGS", panel.centerX(), panel.top + 36 * density, text);
-        // Credit, in the corners beside the title.
+        // Project page, in the corner beside the title.
         text.setTextSize(11 * density);
         text.setColor(0xff9a8a88);
-        text.setTextAlign(Paint.Align.LEFT);
-        c.drawText(SetupActivity.CREDIT, panel.left + pad, panel.top + 34 * density, text);
         text.setTextAlign(Paint.Align.RIGHT);
-        c.drawText(SetupActivity.CREDIT_URL, panel.right - pad, panel.top + 34 * density, text);
+        c.drawText(PROJECT_URL, panel.right - pad, panel.top + 34 * density, text);
         text.setTextAlign(Paint.Align.CENTER);
         // two columns of settings
         int rows = (settings.length + 1) / 2;
