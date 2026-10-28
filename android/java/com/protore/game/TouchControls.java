@@ -527,18 +527,31 @@ public class TouchControls extends View implements InputManager.InputDeviceListe
         return -1;
     }
 
-    /** Pushes the game's mouse cursor out towards one wheel entry, then lets go of R so the game takes it. */
+    /**
+     * Points the game's mouse cursor at one wheel entry, then lets go of R so the game takes it.
+     * SDL keeps the cursor inside the window while it adds up relative motion, so wherever the last camera drags left
+     * it, it is somewhere in the window. Pushing it into the corner puts it at a known place, half a window back is the
+     * middle where the wheel is centred, and a push from there goes out exactly towards the entry.
+     */
     private void pickPower(int slot) {
         if (powerBusy) return;
         powerBusy = true;
+        final float w = getWidth(), h = getHeight();
         double a = Math.toRadians(SLOT_DEG[slot]);
-        final float ux = (float) Math.cos(a) * 140, uy = (float) Math.sin(a) * 140;
-        for (int k = 0; k < 10; k++) ui.postDelayed(() -> mouseMoveBy(ux, uy), k * 16L);
+        final float tx = (float) Math.cos(a) * 0.33f * h, ty = (float) Math.sin(a) * 0.33f * h;
+        long t = 0;
+        for (int k = 0; k < 6; k++, t += 16) pushMouse(t, -w * 1.1f / 6, -h * 1.1f / 6);  // into the top left corner
+        for (int k = 0; k < 3; k++, t += 16) pushMouse(t, w / 6, h / 6);                    // to the middle
+        for (int k = 0; k < 3; k++, t += 16) pushMouse(t, tx / 3, ty / 3);                  // out to the entry
         ui.postDelayed(() -> {
             setPowerMode(false);
             powerBusy = false;
             invalidate();
-        }, 320);
+        }, t + 220);
+    }
+
+    private void pushMouse(long delay, final float dx, final float dy) {
+        ui.postDelayed(() -> mouseMoveBy(dx, dy), delay);
     }
 
     private void releaseAll() {
