@@ -68,10 +68,13 @@ public class TouchControls extends View implements InputManager.InputDeviceListe
         float customX = -1, customY = -1;
         float size = 1;  // the layout editor's per-button size factor
         boolean quickPower;  // DISGUISE / ATK PWR / DEFENSE / SENSE: shown only with the "Power buttons" setting
-        // POWERS and DISGUISE hold a selection wheel open: sliding the finger that holds the button moves the mouse,
-        // which is how the game picks an entry, so one thumb is enough. fx/fy: where that finger is.
+        // POWERS and DISGUISE open a selection wheel. A tap leaves it open (stickyWheel), a slide anywhere on the
+        // screen then moves the mouse, which is how the game picks an entry; a second tap on the button selects.
+        // Holding the button and sliding that same finger still works. fx/fy: where that finger is.
         final boolean wheel;
         float fx, fy;
+        float downX, downY;  // where the finger landed
+        boolean slid;        // moved far enough to count as "hold and slide" instead of a tap
         float cx, cy, r;
         int pointer = -1;
 
@@ -207,6 +210,7 @@ public class TouchControls extends View implements InputManager.InputDeviceListe
     private float lookX, lookY, lastMouseX, lastMouseY;
     private int mouseState = 0;
     private final Map<Integer, Button> pointerButton = new HashMap<>();
+    private Button stickyWheel;  // the wheel button whose key is held down after a tap, or null
 
     public TouchControls(Context context) {
         super(context);
@@ -485,7 +489,14 @@ public class TouchControls extends View implements InputManager.InputDeviceListe
         stickY = knobY = stickHomeY;
     }
 
+    private void closeWheel() {
+        if (stickyWheel == null) return;
+        key(stickyWheel.keycode, false);
+        stickyWheel = null;
+    }
+
     private void releaseAll() {
+        closeWheel();
         for (Button b : buttons) if (b.pointer >= 0) release(b);
         if (stickPointer >= 0) releaseStick();
         setRun(false, false);
@@ -624,11 +635,17 @@ public class TouchControls extends View implements InputManager.InputDeviceListe
                         break;
                     }
                 }
-                if (hit != null) {
+                if (hit != null && hit.wheel && stickyWheel == hit) {
+                    closeWheel();  // second tap: let go of the key, the game picks what the wheel points at
+                } else if (hit != null) {
+                    if (stickyWheel != null) closeWheel();
                     hit.fx = x;
                     hit.fy = y;
+                    hit.downX = x;
+                    hit.downY = y;
+                    hit.slid = false;
                     press(hit, id);
-                } else if (gameMode && !controlsHidden() && stickPointer < 0 && x < getWidth() * 0.4f
+                } else if (gameMode && !controlsHidden() && stickPointer < 0 && stickyWheel == null && x < getWidth() * 0.4f
                         && y > getHeight() * 0.35f) {
                     stickPointer = id;
                     stickX = x;  // the stick centres where the thumb lands
@@ -655,11 +672,12 @@ public class TouchControls extends View implements InputManager.InputDeviceListe
                         mouseMoveBy((px - held.fx) * g, (py - held.fy) * g);
                         held.fx = px;
                         held.fy = py;
+                        if (Math.hypot(px - held.downX, py - held.downY) > 28 * density) held.slid = true;
                     } else if (pid == stickPointer) {
                         updateStick(px, py);
                     } else if (pid == lookPointer) {
-                        float g = 1.5f * camGain;
-                        if (gameMode) mouseMoveBy((px - lookX) * g, (py - lookY) * g * (invertY ? -1 : 1));
+                        float g = (stickyWheel != null ? 2.5f : 1.5f) * camGain;
+                        if (gameMode) mouseMoveBy((px - lookX) * g, (py - lookY) * g * (invertY && stickyWheel == null ? -1 : 1));
                         else mouseMoveTo(px, py);
                         lookX = px;
                         lookY = py;
@@ -681,7 +699,15 @@ public class TouchControls extends View implements InputManager.InputDeviceListe
                         gameMode = !gameMode;
                     }
                 } else if (pointerButton.containsKey(id)) {
-                    release(pointerButton.get(id));
+                    Button up = pointerButton.get(id);
+                    if (up.wheel && !up.slid && stickyWheel == null) {
+                        // a tap: keep the key down so the wheel stays open for a slide with any finger
+                        pointerButton.remove(id);
+                        up.pointer = -1;
+                        stickyWheel = up;
+                    } else {
+                        release(up);
+                    }
                 } else if (id == stickPointer) {
                     releaseStick();
                 } else if (id == lookPointer) {
@@ -795,8 +821,8 @@ public class TouchControls extends View implements InputManager.InputDeviceListe
     }
 
     private void drawButton(Canvas c, Button b) {
-        final boolean down = b.pointer >= 0;
-        if (down && b.wheel) {  // where the held finger points the wheel
+        final boolean down = b.pointer >= 0 || b == stickyWheel;
+        if (b.pointer >= 0 && b.wheel) {  // where the held finger points the wheel
             edge.setStrokeWidth(3 * density);
             edge.setColor(0xccffffff);
             c.drawLine(b.cx, b.cy, b.fx, b.fy, edge);
@@ -1093,6 +1119,13 @@ public class TouchControls extends View implements InputManager.InputDeviceListe
         if (gameMode && !controlsHidden()) drawStick(canvas);
         for (Button b : buttons) {
             if (visible(b)) drawButton(canvas, b);
+        }
+        if (stickyWheel != null) {
+            text.setTextSize(13 * density);
+            text.setTextAlign(Paint.Align.CENTER);
+            text.setColor(0xffffe9e4);
+            canvas.drawText("SLIDE TO CHOOSE  \u00b7  TAP " + stickyWheel.label + " TO SELECT",
+                    getWidth() / 2f, 30 * density, text);
         }
         if (panelOpen) drawPanel(canvas);
     }
