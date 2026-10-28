@@ -1,0 +1,53 @@
+diff --git a/src/d3d9/d3d9_swapchain.cpp b/src/d3d9/d3d9_swapchain.cpp
+--- a/src/d3d9/d3d9_swapchain.cpp
++++ b/src/d3d9/d3d9_swapchain.cpp
+@@ -821,6 +821,19 @@
+   }
+ 
+ 
++#ifdef __ANDROID__
++  // Android port: Present waits for a free swap chain image and for the frame latency limit, i.e. for the GPU.
++  // Holding the device lock meanwhile stalls every other thread's buffer locks behind the GPU (the engine fills
++  // vertex buffers from its worker threads), so these waits run unlocked; Present is the only user of the swap
++  // chain state they touch. It is entered with the lock taken exactly once (D3D9SwapChainEx::Present).
++  struct D3D9PresentUnlocked {
++    D3D9DeviceMutex* m;
++    explicit D3D9PresentUnlocked(D3D9DeviceEx* device) : m(device->DeviceMutex()) { if (m) m->unlock(); }
++    ~D3D9PresentUnlocked() { if (m) m->lock(); }
++  };
++#endif
++
++
+   void D3D9SwapChainEx::PresentImage(UINT SyncInterval) {
+     m_parent->EndFrame(m_latencyTracker);
+     m_parent->Flush();
+@@ -838,7 +851,14 @@
+     PresenterSync sync = { };
+     Rc<DxvkImage> backBuffer;
+ 
++#ifdef __ANDROID__
++    {
++      D3D9PresentUnlocked unlocked(m_parent);
++      status = m_wctx->presenter->acquireNextImage(sync, backBuffer);
++    }
++#else
+     status = m_wctx->presenter->acquireNextImage(sync, backBuffer);
++#endif
+ 
+     if (status >= 0 && status != VK_NOT_READY) {
+       VkRect2D srcRect = {
+@@ -908,7 +928,14 @@
+         m_latencyTracker->discardTimings();
+     }
+ 
++#ifdef __ANDROID__
++    {
++      D3D9PresentUnlocked unlocked(m_parent);
++      SyncFrameLatency();
++    }
++#else
+     SyncFrameLatency();
++#endif
+ 
+     DxvkLatencyStats latencyStats = { };
+ 
