@@ -1,3 +1,4 @@
+# Builds libdxvk_d3d9.so, libSDL2.so and libFAudio.so for arm64 and publishes libdxvk_d3d9.so to the build-output branch.
 # Third-party native libraries of the Android port (SDL2, FAudio, DXVK d3d9; Turnip and libadrenotools for
 # Adreno), built on GitHub's runners.
 # Nothing here touches game files or code generated from them: the recompiled engine is built locally only.
