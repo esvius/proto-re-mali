@@ -34,5 +34,5 @@ jobs:
           git init -q
           git checkout -q -b build-output-dex
           git add classes.dex
-          git -c user.name=ci -c user.email=ci@users.noreply.github.com commit -qm "classes.dex from ${{ github.sha }}"
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" commit -qm "classes.dex from ${{ github.sha }}"
           git push -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}" build-output-dex

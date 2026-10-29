@@ -53,7 +53,7 @@ jobs:
           git init -q
           git checkout -q -b build-output
           git add libdxvk_d3d9.so
-          git -c user.name=ci -c user.email=ci@users.noreply.github.com commit -qm "libdxvk_d3d9.so from ${{ github.sha }}"
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" commit -qm "libdxvk_d3d9.so from ${{ github.sha }}"
           git push -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}" build-output
 
       - uses: actions/upload-artifact@v4
