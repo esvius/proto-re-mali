@@ -1,0 +1,28 @@
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag
+        required: true
+        default: v0.1.9-mali
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: release-staging
+      - name: Create the release with the APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ inputs.tag }}" prototype-0.1.9-mali.apk \
+            --repo "${{ github.repository }}" \
+            --title "proto-re-mali 0.1.9-mali" \
+            --notes-file notes.md \
+            --target main
