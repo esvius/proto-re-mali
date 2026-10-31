@@ -10,16 +10,20 @@ The APK contains no game data, you copy the files from your own copy of the game
 
 ## Status
 
-| | |
-|---|---|
-| Tested on | Realme 8, MediaTek Helio G95, Mali-G76 MC4 |
-| Vulkan driver | 1.1.177 (system driver) |
-| Result | menus, missions and combat work; about 30 to 40 FPS in gameplay at 540p with half size textures |
+| Phone | Chip / GPU | Result |
+|---|---|---|
+| Realme 8 | MediaTek Helio G95, Mali-G76 MC4, Vulkan 1.1.177 | menus, missions and combat work; about 30 to 40 FPS in gameplay at 540p with half size textures (my own phone) |
+| Samsung Galaxy S20 FE (SM-G780F) | Exynos 990, Mali-G77 | "very good" FPS at minimum settings, no numbers given (tester report) |
+| Redmi Note 9 | MediaTek Helio G85 | about 15 FPS or less (tester report) |
+
+The last two rows are reports from testers, not my own measurements. The game is CPU bound, so the CPU decides how
+well it runs far more than the GPU does; weak processors like the Helio G85 are the hardest case. If you try it on
+another phone, please report the model, the chip and what you saw (see "Reporting a problem").
 
 - Menus run at well over 100 FPS. Gameplay is CPU bound, like in the original port.
 - The first minutes can stutter (DXVK compiles shaders it has not seen yet, and every new area loads textures). It
   settles down after that, and the DXVK cache in the app folder makes it better each run. Do not delete it.
-- A full playthrough is not tested. Other Mali GPUs (G52, G57, G68, ...) are untested.
+- A full playthrough is not tested. Other Mali GPUs (G52, G57, G68, ...) have only the reports above.
 - Videos (Bink) do not play, same as in the original port.
 
 ## What this version has
