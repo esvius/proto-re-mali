@@ -1155,15 +1155,98 @@ public class TouchControls extends View implements InputManager.InputDeviceListe
         }
     };
 
+    // ---- CPU profile for performance reports ----
+    // Every 5 seconds one line goes to proto-threads.log in the app's files folder: the game's FPS, the busiest
+    // threads of this process (name, share of one core, the core they last ran on) and, where Android lets an app
+    // read them, the CPU frequencies and a temperature. It shows which thread limits the frame rate.
+    private volatile boolean profRunning;
+    private Thread profThread;
+
+    private static String readFirstLine(File f) {
+        try (java.io.BufferedReader r = new java.io.BufferedReader(new java.io.FileReader(f))) {
+            return r.readLine();
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private void startProfile() {
+        if (profRunning) return;
+        File dir = getContext().getExternalFilesDir(null);
+        if (dir == null) return;
+        final File log = new File(dir, "proto-threads.log");
+        profRunning = true;
+        profThread = new Thread(() -> {
+            Map<Integer, Long> prevTicks = new HashMap<>();
+            long prevNs = System.nanoTime();
+            long startNs = prevNs;
+            try (FileWriter w = new FileWriter(log, false)) {
+                while (profRunning) {
+                    Thread.sleep(5000);
+                    long now = System.nanoTime();
+                    double elapsedMs = (now - prevNs) / 1e6;
+                    prevNs = now;
+                    File[] tasks = new File("/proc/self/task").listFiles();
+                    if (tasks == null) continue;
+                    List<String[]> rows = new ArrayList<>();
+                    Map<Integer, Long> cur = new HashMap<>();
+                    for (File t : tasks) {
+                        String st = readFirstLine(new File(t, "stat"));
+                        if (st == null) continue;
+                        int a = st.indexOf('('), b = st.lastIndexOf(')');
+                        if (a < 0 || b < a) continue;
+                        String[] f = st.substring(b + 2).split(" ");
+                        if (f.length < 37) continue;
+                        int tid = Integer.parseInt(t.getName());
+                        long ticks = Long.parseLong(f[11]) + Long.parseLong(f[12]);  // utime + stime, 1/100 s
+                        cur.put(tid, ticks);
+                        Long before = prevTicks.get(tid);
+                        double pct = before == null ? 0 : (ticks - before) * 10.0 / elapsedMs * 100.0;
+                        rows.add(new String[] {String.format("%06.1f", pct), st.substring(a + 1, b), f[36],
+                                String.format("%.0f", pct)});
+                    }
+                    prevTicks = cur;
+                    java.util.Collections.sort(rows, (x, y) -> y[0].compareTo(x[0]));
+                    StringBuilder sb = new StringBuilder();
+                    float fps = 0;
+                    try { fps = nativeFps(); } catch (UnsatisfiedLinkError ignored) { }
+                    sb.append(String.format("%ds fps=%.0f |", (now - startNs) / 1000000000L, fps));
+                    for (int i = 0; i < Math.min(8, rows.size()); i++) {
+                        String[] r = rows.get(i);
+                        if (Double.parseDouble(r[0]) < 2) break;
+                        sb.append(' ').append(r[1]).append(':').append(r[3]).append("%@c").append(r[2]);
+                    }
+                    StringBuilder fr = new StringBuilder(" | MHz");
+                    for (int c = 0; c < 8; c++) {
+                        String v = readFirstLine(new File("/sys/devices/system/cpu/cpu" + c + "/cpufreq/scaling_cur_freq"));
+                        if (v == null) break;
+                        fr.append(' ').append(Long.parseLong(v.trim()) / 1000);
+                    }
+                    if (fr.length() > 6) sb.append(fr);
+                    String temp = readFirstLine(new File("/sys/class/thermal/thermal_zone0/temp"));
+                    if (temp != null) sb.append(" | zone0 ").append(temp.trim());
+                    w.write(sb.append('\n').toString());
+                    w.flush();
+                }
+            } catch (Exception ignored) {
+                // diagnostics only
+            }
+        }, "proto-profile");
+        profThread.setDaemon(true);
+        profThread.start();
+    }
+
     @Override
     protected void onAttachedToWindow() {
         super.onAttachedToWindow();
         postDelayed(uiShotPoll, 1000);
+        startProfile();
     }
 
     @Override
     protected void onDetachedFromWindow() {
         removeCallbacks(uiShotPoll);
+        profRunning = false;
         super.onDetachedFromWindow();
     }
 
