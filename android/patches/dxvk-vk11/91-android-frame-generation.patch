@@ -1,0 +1,394 @@
+diff --git a/src/dxvk/dxvk_swapchain_blitter.h b/src/dxvk/dxvk_swapchain_blitter.h
+--- a/src/dxvk/dxvk_swapchain_blitter.h
++++ b/src/dxvk/dxvk_swapchain_blitter.h
+@@ -49,6 +49,9 @@
+     VkBool32 compositeHud = VK_FALSE;
+     /// Bit indicating whether the software cursor needs to be composited
+     VkBool32 compositeCursor = VK_FALSE;
++    /// Android frame generation: draw with a constant 50% blend over what
++    /// is already in the target (the previous frame)
++    VkBool32 halfBlend = VK_FALSE;
+ 
+     size_t hash() const {
+       DxvkHashState hash;
+@@ -61,6 +64,7 @@
+       hash.add(uint32_t(needsGamma));
+       hash.add(uint32_t(compositeHud));
+       hash.add(uint32_t(compositeCursor));
++      hash.add(uint32_t(halfBlend));
+       return hash;
+     }
+ 
+@@ -73,7 +77,8 @@
+           && needsBlit == other.needsBlit
+           && needsGamma == other.needsGamma
+           && compositeHud == other.compositeHud
+-          && compositeCursor == other.compositeCursor;
++          && compositeCursor == other.compositeCursor
++          && halfBlend == other.halfBlend;
+     }
+   };
+ 
+@@ -129,13 +134,17 @@
+      * \param [in] srcView Image to present
+      * \param [in] srcColorSpace Image color space
+      * \param [in] srcRect Source rectangle to present
++     * \param [in] blendView Optional second image of the same size.
++     *    If set, the swap chain image shows the average of srcView and
++     *    blendView (used for generated in-between frames).
+      */
+     void present(
+       const DxvkContextObjects& ctx,
+       const Rc<DxvkImageView>&  dstView,
+             VkRect2D            dstRect,
+       const Rc<DxvkImageView>&  srcView,
+-            VkRect2D            srcRect);
++            VkRect2D            srcRect,
++      const Rc<DxvkImageView>&  blendView = nullptr);
+ 
+     /**
+      * \brief Sets gamma ramp
+@@ -260,7 +269,8 @@
+             VkRect2D                    dstRect,
+       const Rc<DxvkImageView>&          srcView,
+             VkRect2D                    srcRect,
+-            VkBool32                    composite);
++            VkBool32                    composite,
++            VkBool32                    halfBlend = VK_FALSE);
+ 
+     void renderHudImage(
+       const DxvkContextObjects&         ctx,
+diff --git a/src/dxvk/dxvk_swapchain_blitter.cpp b/src/dxvk/dxvk_swapchain_blitter.cpp
+--- a/src/dxvk/dxvk_swapchain_blitter.cpp
++++ b/src/dxvk/dxvk_swapchain_blitter.cpp
+@@ -55,7 +55,8 @@
+     const Rc<DxvkImageView>&  dstView,
+           VkRect2D            dstRect,
+     const Rc<DxvkImageView>&  srcView,
+-          VkRect2D            srcRect) {
++          VkRect2D            srcRect,
++    const Rc<DxvkImageView>&  blendView) {
+     std::unique_lock lock(m_mutex);
+ 
+     // Update HUD, if we have one
+@@ -173,6 +174,12 @@
+ 
+     performDraw(ctx, dstView, dstRect,
+       srcView, srcRect, composite);
++
++    // Generated frame: the second image goes on top at 50%
++    if (blendView) {
++      performDraw(ctx, dstView, dstRect,
++        blendView, srcRect, composite, VK_TRUE);
++    }
+ 
+     if (!composite) {
+       if (m_hud)
+@@ -310,7 +317,8 @@
+           VkRect2D            dstRect,
+     const Rc<DxvkImageView>&  srcView,
+           VkRect2D            srcRect,
+-          VkBool32            composite) {
++          VkBool32            composite,
++          VkBool32            halfBlend) {
+     VkColorSpaceKHR dstColorSpace = dstView->image()->info().colorSpace;
+     VkColorSpaceKHR srcColorSpace = srcView->image()->info().colorSpace;
+ 
+@@ -362,6 +370,7 @@
+     key.needsBlit = dstRect.extent != srcRect.extent;
+     key.compositeHud = composite && m_hudView;
+     key.compositeCursor = composite && m_cursorView;
++    key.halfBlend = halfBlend;
+ 
+     VkPipeline pipeline = getPipeline(key);
+ 
+@@ -1126,6 +1135,15 @@
+     cbState.pAttachments = &cbAttachment;
+     cbState.blendConstants[3] = 1.0f;
+ 
++    // Frame generation: result = src * 0.5 + (what the first draw left in the target) * 0.5
++    if (key.halfBlend) {
++      cbAttachment.srcColorBlendFactor = VK_BLEND_FACTOR_CONSTANT_COLOR;
++      cbAttachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR;
++      cbState.blendConstants[0] = 0.5f;
++      cbState.blendConstants[1] = 0.5f;
++      cbState.blendConstants[2] = 0.5f;
++    }
++
+     const std::array<VkDynamicState, 2> dynStates = hasExtendedDynamicState
+       ? std::array<VkDynamicState, 2>{ VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT, VK_DYNAMIC_STATE_SCISSOR_WITH_COUNT }
+       : std::array<VkDynamicState, 2>{ VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+diff --git a/src/d3d9/d3d9_swapchain.h b/src/d3d9/d3d9_swapchain.h
+--- a/src/d3d9/d3d9_swapchain.h
++++ b/src/d3d9/d3d9_swapchain.h
+@@ -166,6 +166,17 @@
+ 
+     uint32_t                  m_frameLatencyCap = 0;
+ 
++    // Android frame generation: shows an in-between frame (the average of the
++    // previous and the current frame) before every real one. Off by default,
++    // enabled with frame_gen = 1 in protore.ini.
++    bool                      m_frameGen = false;
++    uint32_t                  m_frameGenFactor = 1u;
++    Rc<DxvkImage>             m_prevFrameImage;
++    Rc<DxvkImageView>         m_prevFrameView;
++    bool                      m_prevFrameValid = false;
++
++    bool EnsurePrevFrame(const Rc<DxvkImage>& swapImage);
++
+     HWND                      m_window   = nullptr;
+     HMONITOR                  m_monitor  = nullptr;
+ 
+diff --git a/src/d3d9/d3d9_swapchain.cpp b/src/d3d9/d3d9_swapchain.cpp
+--- a/src/d3d9/d3d9_swapchain.cpp
++++ b/src/d3d9/d3d9_swapchain.cpp
+@@ -4,6 +4,10 @@
+ 
+ #include "d3d9_hud.h"
+ #include "d3d9_window.h"
++
++#include <cstdlib>
++#include <fstream>
++#include <string>
+ 
+ namespace dxvk {
+ 
+@@ -12,6 +16,41 @@
+     if (x > 1.0f) x = 1.0f;
+     return uint16_t(65535.0f * x);
+   }
++
++#ifdef __ANDROID__
++  // frame_gen = 1 in protore.ini (or PROTORE_FRAME_GEN=1 in the environment)
++  static bool ReadFrameGenSetting() {
++    if (const char* env = std::getenv("PROTORE_FRAME_GEN"))
++      return std::atoi(env) != 0;
++
++    const char* dir = std::getenv("DXVK_STATE_CACHE_PATH");
++
++    if (!dir || !*dir)
++      return false;
++
++    std::ifstream file(std::string(dir) + "/protore.ini");
++    std::string line;
++
++    while (std::getline(file, line)) {
++      size_t eq = line.find('=');
++
++      if (eq == std::string::npos || line[0] == '#')
++        continue;
++
++      auto trim = [] (std::string s) {
++        size_t a = s.find_first_not_of(" \t\r\n");
++        size_t b = s.find_last_not_of(" \t\r\n");
++        return a == std::string::npos ? std::string() : s.substr(a, b - a + 1);
++      };
++
++      if (trim(line.substr(0, eq)) == "frame_gen")
++        return std::atoi(trim(line.substr(eq + 1)).c_str()) != 0;
++    }
++
++    return false;
++  }
++#endif
++
+ 
+   D3D9SwapChainEx::D3D9SwapChainEx(
+           D3D9DeviceEx*          pDevice,
+@@ -23,6 +62,13 @@
+     , m_frameLatencyCap  (pDevice->GetOptions()->maxFrameLatency)
+     , m_latencyTracking  (EnableLatencyTracking)
+     , m_swapchainExt     (this) {
++#ifdef __ANDROID__
++    m_frameGen = ReadFrameGenSetting();
++
++    if (m_frameGen)
++      Logger::info("D3D9SwapChainEx: frame generation enabled");
++#endif
++
+     this->NormalizePresentParameters(pPresentParams);
+     m_presentParams = *pPresentParams;
+     m_window = m_presentParams.hDeviceWindow;
+@@ -821,6 +867,50 @@
+   }
+ 
+ 
++  bool D3D9SwapChainEx::EnsurePrevFrame(const Rc<DxvkImage>& swapImage) {
++    const auto& info = swapImage->info();
++
++    if (m_prevFrameImage != nullptr) {
++      const auto& prev = m_prevFrameImage->info();
++
++      if (prev.extent.width == info.extent.width && prev.extent.height == info.extent.height
++       && prev.format == info.format)
++        return true;
++    }
++
++    DxvkImageCreateInfo imageInfo = { };
++    imageInfo.type          = VK_IMAGE_TYPE_2D;
++    imageInfo.format        = info.format;
++    imageInfo.sampleCount   = VK_SAMPLE_COUNT_1_BIT;
++    imageInfo.extent        = { info.extent.width, info.extent.height, 1u };
++    imageInfo.numLayers     = 1u;
++    imageInfo.mipLevels     = 1u;
++    imageInfo.usage         = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
++    imageInfo.stages        = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
++    imageInfo.access        = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
++    imageInfo.tiling        = VK_IMAGE_TILING_OPTIMAL;
++    imageInfo.layout        = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
++    imageInfo.colorSpace    = info.colorSpace;
++    imageInfo.debugName     = "Previous frame";
++
++    m_prevFrameImage = m_device->createImage(imageInfo, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
++
++    DxvkImageViewKey viewInfo = { };
++    viewInfo.viewType   = VK_IMAGE_VIEW_TYPE_2D;
++    viewInfo.usage      = VK_IMAGE_USAGE_SAMPLED_BIT;
++    viewInfo.format     = info.format;
++    viewInfo.aspects    = VK_IMAGE_ASPECT_COLOR_BIT;
++    viewInfo.mipIndex   = 0u;
++    viewInfo.mipCount   = 1u;
++    viewInfo.layerIndex = 0u;
++    viewInfo.layerCount = 1u;
++
++    m_prevFrameView = m_prevFrameImage->createView(viewInfo);
++    m_prevFrameValid = false;
++    return true;
++  }
++
++
+ #ifdef __ANDROID__
+   // Android port: Present waits for a free swap chain image and for the frame latency limit, i.e. for the GPU.
+   // Holding the device lock meanwhile stalls every other thread's buffer locks behind the GPU (the engine fills
+@@ -851,14 +941,31 @@
+     PresenterSync sync = { };
+     Rc<DxvkImage> backBuffer;
+ 
++    // Frame generation needs a second swap chain image for the in-between frame
++    PresenterSync sync2 = { };
++    Rc<DxvkImage> backBuffer2;
++    bool copyPrev = false;
++    bool genFrame = false;
++
+ #ifdef __ANDROID__
+     {
+       D3D9PresentUnlocked unlocked(m_parent);
+       status = m_wctx->presenter->acquireNextImage(sync, backBuffer);
++
++      if (m_frameGen && status >= 0 && status != VK_NOT_READY) {
++        copyPrev = EnsurePrevFrame(swapImage);
++
++        if (copyPrev && m_prevFrameValid) {
++          VkResult status2 = m_wctx->presenter->acquireNextImage(sync2, backBuffer2);
++          genFrame = status2 >= 0 && status2 != VK_NOT_READY;
++        }
++      }
+     }
+ #else
+     status = m_wctx->presenter->acquireNextImage(sync, backBuffer);
+ #endif
++
++    m_frameGenFactor = genFrame ? 2u : 1u;
+ 
+     if (status >= 0 && status != VK_NOT_READY) {
+       VkRect2D srcRect = {
+@@ -869,7 +976,12 @@
+         {  int32_t(m_dstRect.left),                    int32_t(m_dstRect.top)                    },
+         { uint32_t(m_dstRect.right - m_dstRect.left), uint32_t(m_dstRect.bottom - m_dstRect.top) } };
+ 
+-      // Bump frame ID
++      // Bump frame IDs, one per present
++      uint64_t genFrameId = 0u;
++
++      if (genFrame)
++        genFrameId = ++m_wctx->frameId;
++
+       m_wctx->frameId += 1;
+ 
+       // Present from CS thread so that we don't
+@@ -884,6 +996,10 @@
+       viewInfo.layerIndex = 0u;
+       viewInfo.layerCount = 1u;
+ 
++      // With a generated frame the first image shows that one and the second the real frame
++      Rc<DxvkImage> realBuffer = genFrame ? backBuffer2 : backBuffer;
++      PresenterSync realSync = genFrame ? sync2 : sync;
++
+       m_parent->EmitCs([
+         cDevice         = m_device,
+         cPresenter      = m_wctx->presenter,
+@@ -891,11 +1007,18 @@
+         cColorSpace     = m_colorspace,
+         cSrcView        = swapImageView,
+         cSrcRect        = srcRect,
+-        cDstView        = backBuffer->createView(viewInfo),
++        cDstView        = realBuffer->createView(viewInfo),
+         cDstRect        = dstRect,
+-        cSync           = sync,
++        cSync           = realSync,
+         cFrameId        = m_wctx->frameId,
+-        cLatency        = m_latencyTracker
++        cLatency        = m_latencyTracker,
++        cGen            = genFrame,
++        cGenView        = genFrame ? backBuffer->createView(viewInfo) : Rc<DxvkImageView>(),
++        cGenSync        = sync,
++        cGenFrameId     = genFrameId,
++        cPrevImage      = m_prevFrameImage,
++        cPrevView       = m_prevFrameView,
++        cCopyPrev       = copyPrev
+       ] (DxvkContext* ctx) {
+         // Update back buffer color space as necessary
+         if (cSrcView->image()->info().colorSpace != cColorSpace) {
+@@ -905,11 +1028,33 @@
+           ctx->ensureImageCompatibility(cSrcView->image(), usage);
+         }
+ 
++        // In-between frame: the average of the previous and the current frame
++        if (cGen) {
++          auto genObjects = ctx->beginExternalRendering();
++
++          cBlitter->present(genObjects,
++            cGenView, cDstRect, cPrevView, cSrcRect, cSrcView);
++
++          ctx->synchronizeWsi(cGenSync);
++          ctx->flushCommandList(nullptr, nullptr);
++
++          cDevice->presentImage(cPresenter, Rc<DxvkLatencyTracker>(), cGenFrameId, nullptr);
++        }
++
+         // Blit back buffer onto Vulkan swap chain
+         auto contextObjects = ctx->beginExternalRendering();
+ 
+         cBlitter->present(contextObjects,
+           cDstView, cDstRect, cSrcView, cSrcRect);
++
++        // Keep this frame for the next generated one
++        if (cCopyPrev) {
++          VkImageSubresourceLayers layers = { VK_IMAGE_ASPECT_COLOR_BIT, 0u, 0u, 1u };
++
++          ctx->copyImage(cPrevImage, layers, VkOffset3D { 0, 0, 0 },
++            cSrcView->image(), layers, VkOffset3D { 0, 0, 0 },
++            cSrcView->image()->info().extent);
++        }
+ 
+         // Submit command list and present
+         ctx->synchronizeWsi(cSync);
+@@ -917,6 +1062,9 @@
+ 
+         cDevice->presentImage(cPresenter, cLatency, cFrameId, nullptr);
+       });
++
++      if (copyPrev)
++        m_prevFrameValid = true;
+ 
+       m_parent->FlushCsChunk();
+     }
+@@ -1154,7 +1302,7 @@
+ 
+   void D3D9SwapChainEx::SyncFrameLatency() {
+     // Wait for the sync event so that we respect the maximum frame latency
+-    m_wctx->frameLatencySignal->wait(m_wctx->frameId - GetActualFrameLatency());
++    m_wctx->frameLatencySignal->wait(m_wctx->frameId - uint64_t(GetActualFrameLatency()) * m_frameGenFactor);
+   }
+ 
+   uint32_t D3D9SwapChainEx::GetActualFrameLatency() {
