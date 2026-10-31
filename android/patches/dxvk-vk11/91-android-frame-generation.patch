@@ -223,7 +223,7 @@ diff --git a/src/dxvk/dxvk_swapchain_blitter.cpp b/src/dxvk/dxvk_swapchain_blitt
 diff --git a/src/d3d9/d3d9_swapchain.h b/src/d3d9/d3d9_swapchain.h
 --- a/src/d3d9/d3d9_swapchain.h
 +++ b/src/d3d9/d3d9_swapchain.h
-@@ -166,6 +166,17 @@
+@@ -166,6 +166,21 @@
  
      uint32_t                  m_frameLatencyCap = 0;
  
@@ -234,7 +234,11 @@ diff --git a/src/d3d9/d3d9_swapchain.h b/src/d3d9/d3d9_swapchain.h
 +    uint32_t                  m_frameGenFactor = 1u;
 +    Rc<DxvkImage>             m_prevFrameImage;
 +    Rc<DxvkImageView>         m_prevFrameView;
++    Rc<DxvkImage>             m_genImage;
++    Rc<DxvkImageView>         m_genRtView;
++    Rc<DxvkImageView>         m_genSrvView;
 +    bool                      m_prevFrameValid = false;
++    int                       m_frameGenDebug = 0;
 +
 +    bool EnsurePrevFrame(const Rc<DxvkImage>& swapImage);
 +
@@ -261,18 +265,24 @@ diff --git a/src/d3d9/d3d9_swapchain.cpp b/src/d3d9/d3d9_swapchain.cpp
    }
 +
 +#ifdef __ANDROID__
-+  // frame_gen = 1 in protore.ini (or PROTORE_FRAME_GEN=1 in the environment)
-+  static bool ReadFrameGenSetting() {
-+    if (const char* env = std::getenv("PROTORE_FRAME_GEN"))
-+      return std::atoi(env) != 0;
++  // Integer setting from protore.ini (or PROTORE_<KEY> in the environment)
++  static int ReadProtoreInt(const char* key, const char* envName, int fallback) {
++    if (const char* env = std::getenv(envName))
++      return std::atoi(env);
 +
 +    const char* dir = std::getenv("DXVK_STATE_CACHE_PATH");
 +
 +    if (!dir || !*dir)
-+      return false;
++      return fallback;
 +
 +    std::ifstream file(std::string(dir) + "/protore.ini");
 +    std::string line;
++
++    auto trim = [] (std::string s) {
++      size_t a = s.find_first_not_of(" \t\r\n");
++      size_t b = s.find_last_not_of(" \t\r\n");
++      return a == std::string::npos ? std::string() : s.substr(a, b - a + 1);
++    };
 +
 +    while (std::getline(file, line)) {
 +      size_t eq = line.find('=');
@@ -280,38 +290,33 @@ diff --git a/src/d3d9/d3d9_swapchain.cpp b/src/d3d9/d3d9_swapchain.cpp
 +      if (eq == std::string::npos || line[0] == '#')
 +        continue;
 +
-+      auto trim = [] (std::string s) {
-+        size_t a = s.find_first_not_of(" \t\r\n");
-+        size_t b = s.find_last_not_of(" \t\r\n");
-+        return a == std::string::npos ? std::string() : s.substr(a, b - a + 1);
-+      };
-+
-+      if (trim(line.substr(0, eq)) == "frame_gen")
-+        return std::atoi(trim(line.substr(eq + 1)).c_str()) != 0;
++      if (trim(line.substr(0, eq)) == key)
++        return std::atoi(trim(line.substr(eq + 1)).c_str());
 +    }
 +
-+    return false;
++    return fallback;
 +  }
 +#endif
 +
  
    D3D9SwapChainEx::D3D9SwapChainEx(
            D3D9DeviceEx*          pDevice,
-@@ -23,6 +62,13 @@
+@@ -23,6 +62,14 @@
      , m_frameLatencyCap  (pDevice->GetOptions()->maxFrameLatency)
      , m_latencyTracking  (EnableLatencyTracking)
      , m_swapchainExt     (this) {
 +#ifdef __ANDROID__
-+    m_frameGen = ReadFrameGenSetting();
++    m_frameGen = ReadProtoreInt("frame_gen", "PROTORE_FRAME_GEN", 0) != 0;
++    m_frameGenDebug = ReadProtoreInt("frame_gen_debug", "PROTORE_FRAME_GEN_DEBUG", 0);
 +
 +    if (m_frameGen)
-+      Logger::info("D3D9SwapChainEx: frame generation enabled");
++      Logger::info(str::format("D3D9SwapChainEx: frame generation enabled, debug mode ", m_frameGenDebug));
 +#endif
 +
      this->NormalizePresentParameters(pPresentParams);
      m_presentParams = *pPresentParams;
      m_window = m_presentParams.hDeviceWindow;
-@@ -821,6 +867,50 @@
+@@ -821,6 +868,72 @@
    }
  
  
@@ -326,34 +331,56 @@ diff --git a/src/d3d9/d3d9_swapchain.cpp b/src/d3d9/d3d9_swapchain.cpp
 +        return true;
 +    }
 +
-+    DxvkImageCreateInfo imageInfo = { };
-+    imageInfo.type          = VK_IMAGE_TYPE_2D;
-+    imageInfo.format        = info.format;
-+    imageInfo.sampleCount   = VK_SAMPLE_COUNT_1_BIT;
-+    imageInfo.extent        = { info.extent.width, info.extent.height, 1u };
-+    imageInfo.numLayers     = 1u;
-+    imageInfo.mipLevels     = 1u;
-+    imageInfo.usage         = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-+    imageInfo.stages        = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-+    imageInfo.access        = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
-+    imageInfo.tiling        = VK_IMAGE_TILING_OPTIMAL;
-+    imageInfo.layout        = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-+    imageInfo.colorSpace    = info.colorSpace;
-+    imageInfo.debugName     = "Previous frame";
++    // The generated frame is rendered into an image of its own at the game's
++    // resolution and then presented like a real frame, so blending never
++    // happens on the swap chain image itself.
++    auto create = [&] (VkImageUsageFlags usage, VkPipelineStageFlags stages,
++        VkAccessFlags access, const char* name) {
++      DxvkImageCreateInfo imageInfo = { };
++      imageInfo.type          = VK_IMAGE_TYPE_2D;
++      imageInfo.format        = info.format;
++      imageInfo.sampleCount   = VK_SAMPLE_COUNT_1_BIT;
++      imageInfo.extent        = { info.extent.width, info.extent.height, 1u };
++      imageInfo.numLayers     = 1u;
++      imageInfo.mipLevels     = 1u;
++      imageInfo.usage         = usage;
++      imageInfo.stages        = stages;
++      imageInfo.access        = access;
++      imageInfo.tiling        = VK_IMAGE_TILING_OPTIMAL;
++      imageInfo.layout        = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
++      imageInfo.colorSpace    = m_colorspace;
++      imageInfo.debugName     = name;
++      return m_device->createImage(imageInfo, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
++    };
 +
-+    m_prevFrameImage = m_device->createImage(imageInfo, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
++    auto createView = [&] (const Rc<DxvkImage>& image, VkImageUsageFlags usage) {
++      DxvkImageViewKey viewInfo = { };
++      viewInfo.viewType   = VK_IMAGE_VIEW_TYPE_2D;
++      viewInfo.usage      = usage;
++      viewInfo.format     = info.format;
++      viewInfo.aspects    = VK_IMAGE_ASPECT_COLOR_BIT;
++      viewInfo.mipIndex   = 0u;
++      viewInfo.mipCount   = 1u;
++      viewInfo.layerIndex = 0u;
++      viewInfo.layerCount = 1u;
++      return image->createView(viewInfo);
++    };
 +
-+    DxvkImageViewKey viewInfo = { };
-+    viewInfo.viewType   = VK_IMAGE_VIEW_TYPE_2D;
-+    viewInfo.usage      = VK_IMAGE_USAGE_SAMPLED_BIT;
-+    viewInfo.format     = info.format;
-+    viewInfo.aspects    = VK_IMAGE_ASPECT_COLOR_BIT;
-+    viewInfo.mipIndex   = 0u;
-+    viewInfo.mipCount   = 1u;
-+    viewInfo.layerIndex = 0u;
-+    viewInfo.layerCount = 1u;
++    m_prevFrameImage = create(
++      VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
++      VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
++      VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT,
++      "Previous frame");
++    m_prevFrameView = createView(m_prevFrameImage, VK_IMAGE_USAGE_SAMPLED_BIT);
 +
-+    m_prevFrameView = m_prevFrameImage->createView(viewInfo);
++    m_genImage = create(
++      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
++      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
++      VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT,
++      "Generated frame");
++    m_genRtView  = createView(m_genImage, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
++    m_genSrvView = createView(m_genImage, VK_IMAGE_USAGE_SAMPLED_BIT);
++
 +    m_prevFrameValid = false;
 +    return true;
 +  }
@@ -362,7 +389,7 @@ diff --git a/src/d3d9/d3d9_swapchain.cpp b/src/d3d9/d3d9_swapchain.cpp
  #ifdef __ANDROID__
    // Android port: Present waits for a free swap chain image and for the frame latency limit, i.e. for the GPU.
    // Holding the device lock meanwhile stalls every other thread's buffer locks behind the GPU (the engine fills
-@@ -847,55 +937,46 @@
+@@ -847,55 +960,50 @@
      Rc<DxvkImage> swapImage = m_backBuffers[0]->GetCommonTexture()->GetImage();
      Rc<DxvkImageView> swapImageView = m_backBuffers[0]->GetImageView(false);
  
@@ -443,11 +470,15 @@ diff --git a/src/d3d9/d3d9_swapchain.cpp b/src/d3d9/d3d9_swapchain.cpp
 +        cFrameId        = realFrameId,
 +        cLatency        = m_latencyTracker,
 +        cPrevImage      = m_prevFrameImage,
-+        cPrevView       = m_prevFrameView
++        cPrevView       = m_prevFrameView,
++        cGenImage       = m_genImage,
++        cGenRtView      = m_genRtView,
++        cGenSrvView     = m_genSrvView,
++        cDebug          = m_frameGenDebug
        ] (DxvkContext* ctx) {
          // Update back buffer color space as necessary
          if (cSrcView->image()->info().colorSpace != cColorSpace) {
-@@ -905,20 +986,144 @@
+@@ -905,20 +1013,158 @@
            ctx->ensureImageCompatibility(cSrcView->image(), usage);
          }
  
@@ -475,8 +506,22 @@ diff --git a/src/d3d9/d3d9_swapchain.cpp b/src/d3d9/d3d9_swapchain.cpp
 +          if (vr >= 0 && vr != VK_NOT_READY) {
 +            auto genObjects = ctx->beginExternalRendering();
 +
++            // Render the in-between frame into its own image at the game's resolution ...
++            VkRect2D genRect = { { 0, 0 }, { cGenImage->info().extent.width, cGenImage->info().extent.height } };
++
++            // debug 1: the previous frame alone, 2: the current frame alone, otherwise the average
++            if (cDebug == 1)
++              cBlitter->present(genObjects, cGenRtView, genRect, cPrevView, cSrcRect);
++            else if (cDebug == 2)
++              cBlitter->present(genObjects, cGenRtView, genRect, cSrcView, cSrcRect);
++            else
++              cBlitter->present(genObjects, cGenRtView, genRect, cPrevView, cSrcRect, cSrcView);
++
++            genObjects.cmd->track(cGenImage, DxvkAccess::Write);
++
++            // ... and present that like a real frame
 +            cBlitter->present(genObjects,
-+              makeView(genImage), cDstRect, cPrevView, cSrcRect, cSrcView);
++              makeView(genImage), cDstRect, cGenSrvView, genRect);
 +
 +            ctx->synchronizeWsi(genSync);
 +            ctx->flushCommandList(nullptr, nullptr);
@@ -601,7 +646,7 @@ diff --git a/src/d3d9/d3d9_swapchain.cpp b/src/d3d9/d3d9_swapchain.cpp
      }
  
      if (m_latencyTracker) {
-@@ -1154,7 +1359,7 @@
+@@ -1154,7 +1400,7 @@
  
    void D3D9SwapChainEx::SyncFrameLatency() {
      // Wait for the sync event so that we respect the maximum frame latency
